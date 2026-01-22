@@ -45,7 +45,7 @@ This project is intended for experienced Linux admins who understand APT, repo p
 
 ```bash
 git clone https://github.com/LINUXexpert-org/ubuntu2mint.git
-cd ubuntu-to-mint-convert-v3
+cd ubuntu2mint
 sudo bash ubuntu-to-mint-convert-v3.sh doctor
 ````
 
