@@ -147,11 +147,11 @@ detect_ubuntu_codename() {
 set_targets_from_ubuntu() {
   UBUNTU_CODENAME="$(detect_ubuntu_codename)"
   case "$UBUNTU_CODENAME" in
-    noble)
-      UBUNTU_BASE="noble"
-      DEFAULT_MINT="zena"     # Mint 22.3 on Ubuntu Noble base
-      ALLOWED_TARGETS="zena zara xia wilma"
-      ;;
+   noble)
+  UBUNTU_BASE="noble"
+  DEFAULT_MINT="zena"     # Mint 22.3 Zena (Ubuntu Noble base)
+  ALLOWED_TARGETS="zena zara xia wilma"
+  ;;
     jammy)
       UBUNTU_BASE="jammy"
       DEFAULT_MINT="virginia" # Mint 21.3 on Ubuntu Jammy base
