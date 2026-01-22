@@ -279,15 +279,13 @@ detect_ubuntu_mirrors() {
 # KEYRING HANDLING (UPDATED)
 # -----------------------------
 mint_repo_key_write_to() {
-  # Writes the Linux Mint repo signing key to a specified keyring path.
-  # Uses the Ubuntu keyserver and dearmors into the target file.
   local out_keyring="$1"
   local keyid="A6616109451BBBF2"
 
   [[ -n "$out_keyring" ]] || die "mint_repo_key_write_to requires an output path"
 
   DEBIAN_FRONTEND=noninteractive apt-get update -y
-  DEBIAN_FRONTEND=noninteractive apt-get install -y gnupg dirmngr ca-certificates
+  DEBIAN_FRONTEND=noninteractive apt-get install -y gnupg dirmngr ca-certificates curl
 
   mkdir -p "$(dirname "$out_keyring")"
 
@@ -295,11 +293,39 @@ mint_repo_key_write_to() {
   gnupghome="$(mktemp -d)"
   chmod 700 "$gnupghome"
 
-  gpg --homedir "$gnupghome" --batch --keyserver hkps://keyserver.ubuntu.com --recv-keys "$keyid"
-  gpg --homedir "$gnupghome" --batch --export "$keyid" | gpg --dearmor -o "$out_keyring"
+  # 1) Try hkps (443)
+  if gpg --homedir "$gnupghome" --batch --keyserver hkps://keyserver.ubuntu.com --recv-keys "$keyid" >/dev/null 2>&1; then
+    :
+  # 2) Try hkp over port 80 (often allowed when hkps is blocked)
+  elif gpg --homedir "$gnupghome" --batch --keyserver hkp://keyserver.ubuntu.com:80 --recv-keys "$keyid" >/dev/null 2>&1; then
+    :
+  else
+    # 3) Fallback: fetch armored key over HTTPS/HTTP and dearmor
+    info "Keyserver blocked; fetching key over HTTPS from Ubuntu keyserver..."
+    local armored="$gnupghome/linuxmint-repo.asc"
+
+    if ! curl -fsSL "https://keyserver.ubuntu.com/pks/lookup?op=get&search=0x${keyid}" -o "$armored"; then
+      curl -fsSL "http://keyserver.ubuntu.com/pks/lookup?op=get&search=0x${keyid}" -o "$armored" \
+        || die "Unable to fetch Mint repo key via keyserver or HTTPS fallback."
+    fi
+
+    # Basic safety check: ensure the fetched key contains the expected key id (last 16 hex of fingerprint)
+    local fpr_last16
+    fpr_last16="$(gpg --batch --with-colons --show-keys "$armored" | awk -F: '$1=="fpr"{print $10}' | tail -n1 | tail -c 17 | tr -d '\n' | tr '[:lower:]' '[:upper:]')"
+    [[ "$fpr_last16" == "${keyid^^}" ]] || die "Fetched key fingerprint suffix mismatch (expected ${keyid^^}, got ${fpr_last16:-<none>})."
+
+    gpg --batch --dearmor -o "$out_keyring" "$armored"
+    chmod 644 "$out_keyring"
+    rm -rf "$gnupghome"
+    return 0
+  fi
+
+  # If we got here, gpg received the key into temp keyring; export+dearmor
+  gpg --homedir "$gnupghome" --batch --export "$keyid" | gpg --batch --dearmor -o "$out_keyring"
   chmod 644 "$out_keyring"
   rm -rf "$gnupghome"
 }
+
 
 mint_repo_key_install() {
   local keyring="/usr/share/keyrings/linuxmint-repo.gpg"
