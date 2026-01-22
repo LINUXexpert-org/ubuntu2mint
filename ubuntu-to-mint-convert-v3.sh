@@ -147,15 +147,15 @@ detect_ubuntu_codename() {
 set_targets_from_ubuntu() {
   UBUNTU_CODENAME="$(detect_ubuntu_codename)"
   case "$UBUNTU_CODENAME" in
-   noble)
-  UBUNTU_BASE="noble"
-  DEFAULT_MINT="zena"     # Mint 22.3 Zena (Ubuntu Noble base)
-  ALLOWED_TARGETS="zena zara xia wilma"
-  ;;
+    noble)
+      UBUNTU_BASE="noble"
+      DEFAULT_MINT="zena"     # Mint 22.3 Zena (Ubuntu Noble base)
+      ALLOWED_TARGETS=(zena zara xia wilma)
+      ;;
     jammy)
       UBUNTU_BASE="jammy"
       DEFAULT_MINT="virginia" # Mint 21.3 on Ubuntu Jammy base
-      ALLOWED_TARGETS="virginia victoria vera vanessa"
+      ALLOWED_TARGETS=(virginia victoria vera vanessa)
       ;;
     *)
       die "Unsupported Ubuntu codename '$UBUNTU_CODENAME'. Supports Ubuntu noble (24.04) or jammy (22.04) only."
@@ -167,10 +167,19 @@ set_targets_from_ubuntu() {
   fi
 
   local ok_target="no"
-  for t in $ALLOWED_TARGETS; do
-    [[ "$TARGET_MINT" == "$t" ]] && ok_target="yes"
+  for t in "${ALLOWED_TARGETS[@]}"; do
+    if [[ "$TARGET_MINT" == "$t" ]]; then
+      ok_target="yes"
+      break
+    fi
   done
-  [[ "$ok_target" == "yes" ]] || die "--target '$TARGET_MINT' not allowed for Ubuntu '$UBUNTU_CODENAME'. Allowed: $ALLOWED_TARGETS"
+
+  if [[ "$ok_target" != "yes" ]]; then
+    local allowed_str
+    printf -v allowed_str '%s ' "${ALLOWED_TARGETS[@]}"
+    allowed_str="${allowed_str% }"
+    die "--target '$TARGET_MINT' not allowed for Ubuntu '$UBUNTU_CODENAME'. Allowed: $allowed_str"
+  fi
 }
 
 preflight_common() {
