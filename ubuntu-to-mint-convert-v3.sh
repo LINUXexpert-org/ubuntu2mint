@@ -2,17 +2,17 @@
 # ubuntu-to-mint-convert-v3.sh
 #
 # Copyright (C) 2026 LINUXexpert.org
-#
-# This program is free software: you can redistribute it and/or modify it
-# under the terms of the GNU General Public License as published by the
+# 
+# This program is free software: you can redistribute it and/or modify it 
+# under the terms of the GNU General Public License as published by the 
 # Free Software Foundation, version 3 of the License.
-#
-# This program is distributed in the hope that it will be useful, but
-# WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY
-# or FITNESS FOR A PARTICULAR PURPOSE. See the GNU General Public License
+# 
+# This program is distributed in the hope that it will be useful, but 
+# WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY 
+# or FITNESS FOR A PARTICULAR PURPOSE. See the GNU General Public License 
 # for more details.
-#
-# You should have received a copy of the GNU General Public License along
+# 
+# You should have received a copy of the GNU General Public License along 
 # with this program. If not, see <https://www.gnu.org/licenses/>.
 #
 # Keep Ubuntu as the base OS and add Linux Mint repos + Mint desktop/tooling.
@@ -66,7 +66,6 @@ on_err() {
 trap 'on_err "$LINENO" "$?"' ERR
 
 need_root() { [[ ${EUID:-$(id -u)} -eq 0 ]] || die "Run as root (use sudo)."; }
-
 have_cmd() { command -v "$1" >/dev/null 2>&1; }
 
 usage() {
@@ -150,7 +149,7 @@ set_targets_from_ubuntu() {
   case "$UBUNTU_CODENAME" in
     noble)
       UBUNTU_BASE="noble"
-      DEFAULT_MINT="zena"     # Mint 22.3 recommended on Ubuntu Noble base
+      DEFAULT_MINT="zena"     # Mint 22.3 on Ubuntu Noble base
       ALLOWED_TARGETS="zena zara xia wilma"
       ;;
     jammy)
@@ -159,7 +158,7 @@ set_targets_from_ubuntu() {
       ALLOWED_TARGETS="virginia victoria vera vanessa"
       ;;
     *)
-      die "Unsupported Ubuntu codename '$UBUNTU_CODENAME'. This script supports Ubuntu noble (24.04) or jammy (22.04) only."
+      die "Unsupported Ubuntu codename '$UBUNTU_CODENAME'. Supports Ubuntu noble (24.04) or jammy (22.04) only."
       ;;
   esac
 
@@ -167,7 +166,6 @@ set_targets_from_ubuntu() {
     TARGET_MINT="$DEFAULT_MINT"
   fi
 
-  # Validate target is allowed for this base
   local ok_target="no"
   for t in $ALLOWED_TARGETS; do
     [[ "$TARGET_MINT" == "$t" ]] && ok_target="yes"
@@ -187,43 +185,37 @@ preflight_common() {
   set_targets_from_ubuntu
   ok "Ubuntu base: ${UBUNTU_BASE} | Target Mint codename: ${TARGET_MINT} | Edition: ${EDITION}"
 
-  # Refuse containers (too many surprises)
   if have_cmd systemd-detect-virt; then
     if systemd-detect-virt --container >/dev/null 2>&1; then
       die "Detected container environment. Aborting."
     fi
   fi
 
-  # Architecture check
   local arch
   arch="$(dpkg --print-architecture)"
-  [[ "$arch" == "amd64" ]] || warn "Architecture is '$arch'. Mint is typically amd64 on desktops. Proceeding may fail."
+  [[ "$arch" == "amd64" ]] || warn "Architecture is '$arch'. Proceeding may fail."
 
-  # APT locks
   if fuser /var/lib/dpkg/lock >/dev/null 2>&1 || fuser /var/lib/apt/lists/lock >/dev/null 2>&1 || fuser /var/cache/apt/archives/lock >/dev/null 2>&1; then
     die "APT/DPKG lock is held (updates running?). Close Software Updater/apt and try again."
   fi
 
-  # dpkg health
   if dpkg --audit | grep -q .; then
     warn "dpkg reports issues (dpkg --audit not empty). Attempting to fix..."
     DEBIAN_FRONTEND=noninteractive dpkg --configure -a
   fi
   DEBIAN_FRONTEND=noninteractive apt-get -y -f install
 
-  # Network reachability (lightweight)
-  have_cmd curl || DEBIAN_FRONTEND=noninteractive apt-get update -y && DEBIAN_FRONTEND=noninteractive apt-get install -y curl ca-certificates
+  # Network reachability checks (soft warnings)
+  have_cmd curl || (DEBIAN_FRONTEND=noninteractive apt-get update -y && DEBIAN_FRONTEND=noninteractive apt-get install -y curl ca-certificates)
   curl -fsS --max-time 10 "http://archive.ubuntu.com/ubuntu/" >/dev/null || warn "Cannot reach archive.ubuntu.com (may be corporate mirror/proxy setup)."
   curl -fsS --max-time 10 "${MINT_MIRROR%/}/" >/dev/null || warn "Cannot reach Mint mirror ${MINT_MIRROR} (may be intermittent)."
 
-  # Disk space
   local root_free
   root_free="$(df -Pm / | awk 'NR==2{print $4}')"
   if [[ "${root_free:-0}" -lt 6144 ]]; then
     warn "Low free space on / (${root_free} MB). Recommend >= 6GB free."
   fi
 
-  # Battery check (if laptop)
   if [[ -d /sys/class/power_supply ]]; then
     local on_batt="no"
     for ps in /sys/class/power_supply/*; do
@@ -237,7 +229,6 @@ preflight_common() {
     [[ "$on_batt" == "yes" ]] && warn "System appears to be on battery. Plug into AC before convert."
   fi
 
-  # Snap inventory (for corporate safety)
   if have_cmd snap; then
     info "Snap detected. Installed snaps:"
     snap list || true
@@ -248,29 +239,23 @@ preflight_common() {
   ok "Preflight completed."
 }
 
-# Try to detect Ubuntu mirrors from existing config so we don't break corporate proxy/mirrors.
 detect_ubuntu_mirrors() {
   local sources_txt=""
-  # collect possible deb lines from .list and .sources
   if [[ -r /etc/apt/sources.list ]]; then sources_txt+="$(grep -E '^[[:space:]]*deb ' /etc/apt/sources.list || true)"$'\n'; fi
   if compgen -G "/etc/apt/sources.list.d/*.list" >/dev/null; then
     sources_txt+="$(grep -RhsE '^[[:space:]]*deb ' /etc/apt/sources.list.d/*.list || true)"$'\n'
   fi
   if compgen -G "/etc/apt/sources.list.d/*.sources" >/dev/null; then
-    # very rough extraction of URIs from deb822 sources
     sources_txt+="$(grep -RhsE '^[[:space:]]*URIs:[[:space:]]*' /etc/apt/sources.list.d/*.sources | awk '{print $2}' || true)"$'\n'
   fi
 
-  # defaults
   UBUNTU_ARCHIVE_MIRROR="http://archive.ubuntu.com/ubuntu"
   UBUNTU_SECURITY_MIRROR="http://security.ubuntu.com/ubuntu"
 
-  # try to find an existing archive mirror
   local m
   m="$(echo "$sources_txt" | grep -Eo 'https?://[^ ]+/ubuntu' | head -n1 || true)"
   [[ -n "$m" ]] && UBUNTU_ARCHIVE_MIRROR="$m"
 
-  # try to find an existing security mirror
   local s
   s="$(echo "$sources_txt" | grep -Eo 'https?://[^ ]+/ubuntu' | grep -E 'security\.ubuntu\.com|/ubuntu-security' | head -n1 || true)"
   [[ -n "$s" ]] && UBUNTU_SECURITY_MIRROR="$s"
@@ -279,23 +264,36 @@ detect_ubuntu_mirrors() {
   info "Ubuntu security mirror: ${UBUNTU_SECURITY_MIRROR}"
 }
 
-mint_repo_key_install() {
-  # Linux Mint repository signing key (short ID commonly referenced as A6616109451BBBF2)
-  # We fetch via hkps and store as a dedicated keyring file for signed-by usage.
+# -----------------------------
+# KEYRING HANDLING (UPDATED)
+# -----------------------------
+mint_repo_key_write_to() {
+  # Writes the Linux Mint repo signing key to a specified keyring path.
+  # Uses the Ubuntu keyserver and dearmors into the target file.
+  local out_keyring="$1"
   local keyid="A6616109451BBBF2"
-  local keyring="/usr/share/keyrings/linuxmint-repo.gpg"
 
-  info "Installing Linux Mint repo signing key into ${keyring}"
+  [[ -n "$out_keyring" ]] || die "mint_repo_key_write_to requires an output path"
+
   DEBIAN_FRONTEND=noninteractive apt-get update -y
   DEBIAN_FRONTEND=noninteractive apt-get install -y gnupg dirmngr ca-certificates
+
+  mkdir -p "$(dirname "$out_keyring")"
 
   local gnupghome
   gnupghome="$(mktemp -d)"
   chmod 700 "$gnupghome"
+
   gpg --homedir "$gnupghome" --batch --keyserver hkps://keyserver.ubuntu.com --recv-keys "$keyid"
-  gpg --homedir "$gnupghome" --batch --export "$keyid" | gpg --dearmor -o "$keyring"
-  chmod 644 "$keyring"
+  gpg --homedir "$gnupghome" --batch --export "$keyid" | gpg --dearmor -o "$out_keyring"
+  chmod 644 "$out_keyring"
   rm -rf "$gnupghome"
+}
+
+mint_repo_key_install() {
+  local keyring="/usr/share/keyrings/linuxmint-repo.gpg"
+  info "Installing Linux Mint repo signing key into ${keyring}"
+  mint_repo_key_write_to "$keyring"
   ok "Key installed."
 }
 
@@ -320,7 +318,6 @@ deb ${UBUNTU_ARCHIVE_MIRROR%/} ${UBUNTU_BASE}-backports main restricted universe
 deb ${UBUNTU_SECURITY_MIRROR%/} ${UBUNTU_BASE}-security main restricted universe multiverse
 EOF
 
-  # Neutralize /etc/apt/sources.list to avoid dupes
   if [[ -f /etc/apt/sources.list ]]; then
     sed -i 's/^[[:space:]]*deb /# deb /' /etc/apt/sources.list || true
   fi
@@ -332,20 +329,12 @@ write_mint_pinning_system() {
   local pref="/etc/apt/preferences.d/50-linuxmint-conversion.pref"
   info "Writing conservative APT pinning to ${pref}"
 
-  # Conservative:
-  # - Default Mint origin priority low (100) so Ubuntu wins for overlapping packages.
-  # - Promote Mint desktop/tooling patterns to 700 so they come from Mint and update from Mint.
   cat > "$pref" <<'EOF'
-# Conservative pinning for Ubuntu->Mint Option B conversion.
-# Keep Ubuntu as default; allow Mint only for Mint desktop/tooling packages.
-#
-# Default: low priority for Mint origin so it won't replace base packages automatically.
 Package: *
 Pin: origin "packages.linuxmint.com"
 Pin-Priority: 100
 
-# Mint tooling / desktop stack: prefer Mint packages.
-Package: mint* mintsources* mintupdate* mintsystem* mintstick* mintmenu* mintdrivers* mintreport* mintwelcome* mintlocale*
+Package: mint* mintsources* mintupdate* mintsystem* mintstick* mintmenu* mintlocale* mintdrivers* mintreport* mintwelcome*
 Pin: origin "packages.linuxmint.com"
 Pin-Priority: 700
 
@@ -358,23 +347,18 @@ EOF
 }
 
 disable_thirdparty_sources_system() {
-  # Moves third-party sources out of the way to reduce conflicts during install.
-  # We back them up first and leave a marker so rollback can restore.
   local backup_dir="$1"
   local disabled_dir="${backup_dir}/disabled-sources"
   mkdir -p "$disabled_dir"
 
-  info "Disabling 3rd-party sources (PPAs, vendor repos) into: ${disabled_dir}"
+  info "Disabling 3rd-party sources into: ${disabled_dir}"
   shopt -s nullglob
-
   for f in /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources; do
-    # keep our generated official list intact
     [[ "$(basename "$f")" == "official-package-repositories.list" ]] && continue
-    # disable everything else unless user opted to keep
     mv -v "$f" "${disabled_dir}/" || true
   done
-
   shopt -u nullglob
+
   ok "Third-party sources disabled (restorable via rollback)."
 }
 
@@ -394,12 +378,8 @@ backup_system_state() {
   apt-mark showhold > "${backup_dir}/apt-holds.txt" || true
   systemctl list-unit-files --state=enabled > "${backup_dir}/enabled-services.txt" || true
 
-  if have_cmd snap; then
-    snap list > "${backup_dir}/snap-list.txt" || true
-  fi
-  if have_cmd flatpak; then
-    flatpak list > "${backup_dir}/flatpak-list.txt" || true
-  fi
+  if have_cmd snap; then snap list > "${backup_dir}/snap-list.txt" || true; fi
+  if have_cmd flatpak; then flatpak list > "${backup_dir}/flatpak-list.txt" || true; fi
 
   ok "Backup complete."
   echo "$backup_dir"
@@ -408,36 +388,56 @@ backup_system_state() {
 timeshift_snapshot_best_effort() {
   if have_cmd timeshift; then
     info "Timeshift detected. Attempting pre-change snapshot (best-effort)..."
-    # Timeshift might not be configured; don't fail conversion if it can't snapshot.
     timeshift --create --comments "pre ubuntu->mint option-b $(date -Is)" --tags D || warn "Timeshift snapshot failed (may not be configured)."
   else
     warn "Timeshift not installed. Strongly recommended to snapshot/backup before converting."
   fi
 }
 
+# ---------------------------------------
+# PLAN MODE (UPDATED - SELF-SUFFICIENT)
+# ---------------------------------------
 apt_simulate_with_temp_sources() {
-  # Use a temporary APT environment for plan mode: no system changes.
+  # Plan mode: simulate using a temporary APT environment.
+  # NOTE: This does not change system APT sources. It MAY install gnupg/dirmngr if missing,
+  # because we need to fetch and dearmor the Mint repo key for signed-by verification.
+
   local tmp
   tmp="$(mktemp -d)"
-  mkdir -p "$tmp/etc/apt/sources.list.d" "$tmp/var/lib/apt/lists/partial" "$tmp/var/cache/apt/archives/partial"
+  mkdir -p \
+    "$tmp/etc/apt/sources.list.d" \
+    "$tmp/etc/apt/preferences.d" \
+    "$tmp/var/lib/apt/lists/partial" \
+    "$tmp/var/cache/apt/archives/partial" \
+    "$tmp/usr/share/keyrings"
 
-  # Keyring: use system keyring file if present; otherwise, we can't verify Mint repo.
-  local keyring="/usr/share/keyrings/linuxmint-repo.gpg"
-  [[ -r "$keyring" ]] || die "Mint keyring not found at ${keyring}. Run convert once (it installs key) or install key manually."
+  local temp_keyring="$tmp/usr/share/keyrings/linuxmint-repo.gpg"
+  info "Plan mode: creating temporary Mint keyring at $temp_keyring"
+  mint_repo_key_write_to "$temp_keyring"
 
   detect_ubuntu_mirrors
+
   cat > "$tmp/etc/apt/sources.list" <<EOF
-deb [signed-by=${keyring}] ${MINT_MIRROR%/} ${TARGET_MINT} main upstream import backport
+deb [signed-by=${temp_keyring}] ${MINT_MIRROR%/} ${TARGET_MINT} main upstream import backport
 deb ${UBUNTU_ARCHIVE_MIRROR%/} ${UBUNTU_BASE} main restricted universe multiverse
 deb ${UBUNTU_ARCHIVE_MIRROR%/} ${UBUNTU_BASE}-updates main restricted universe multiverse
 deb ${UBUNTU_ARCHIVE_MIRROR%/} ${UBUNTU_BASE}-backports main restricted universe multiverse
 deb ${UBUNTU_SECURITY_MIRROR%/} ${UBUNTU_BASE}-security main restricted universe multiverse
 EOF
 
-  # Pinning file inside temp etc
-  mkdir -p "$tmp/etc/apt/preferences.d"
-  write_mint_pinning_system >/dev/null 2>&1 || true
-  cp -a /etc/apt/preferences.d/50-linuxmint-conversion.pref "$tmp/etc/apt/preferences.d/" 2>/dev/null || true
+  cat > "$tmp/etc/apt/preferences.d/50-linuxmint-conversion.pref" <<'EOF'
+Package: *
+Pin: origin "packages.linuxmint.com"
+Pin-Priority: 100
+
+Package: mint* mintsources* mintupdate* mintsystem* mintstick* mintmenu* mintlocale* mintdrivers* mintreport* mintwelcome*
+Pin: origin "packages.linuxmint.com"
+Pin-Priority: 700
+
+Package: cinnamon* nemo* muffin* cjs* xapp* slick-greeter* lightdm* pix* xviewer* mint-themes* mint-y-icons* mint-x-icons*
+Pin: origin "packages.linuxmint.com"
+Pin-Priority: 700
+EOF
 
   info "Plan mode: apt update (temporary dirs)..."
   apt-get \
@@ -460,20 +460,20 @@ EOF
   pkgs+=(mint-meta-core mint-meta-codecs mintsystem mintupdate mintsources)
 
   info "Plan mode: simulated install: ${pkgs[*]}"
+  local plan_log="$LOG_DIR/plan-$(date +%Y%m%d-%H%M%S).txt"
   apt-get \
     -o Dir::Etc="$tmp/etc/apt" \
     -o Dir::State="$tmp/var/lib/apt" \
     -o Dir::Cache="$tmp/var/cache/apt" \
     -o Dir::State::status="/var/lib/dpkg/status" \
     -o Acquire::Retries=3 \
-    -s install $recommends "${pkgs[@]}" | tee "$LOG_DIR/plan-$(date +%Y%m%d-%H%M%S).txt" >/dev/null
+    -s install $recommends "${pkgs[@]}" | tee "$plan_log" >/dev/null
 
   rm -rf "$tmp"
-  ok "Plan completed. Review the plan log in ${LOG_DIR}."
+  ok "Plan completed. Review: $plan_log"
 }
 
 parse_and_guard_apt_actions() {
-  # Guard rails: abort if apt wants to remove critical packages.
   local sim_output_file="$1"
   [[ -r "$sim_output_file" ]] || die "Missing simulation output: $sim_output_file"
 
@@ -484,7 +484,6 @@ parse_and_guard_apt_actions() {
 
   info "APT simulation: packages marked for removal: ${removed_count}"
 
-  # Critical packages we refuse to remove (extend as needed)
   local critical_re='^(sudo|openssh-server|ssh|network-manager|systemd|systemd-sysv|dbus|polkit|linux-image|linux-generic|linux-modules|grub|grub2|initramfs-tools|libc6|libstdc\+\+6|snapd)$'
   local bad=""
   while IFS= read -r p; do
@@ -500,15 +499,14 @@ parse_and_guard_apt_actions() {
   fi
 
   if [[ "$removed_count" -gt 20 ]]; then
-    die "Refusing to proceed: too many removals (${removed_count}). Re-run with --with-recommends off (default), or inspect conflicts."
+    die "Refusing to proceed: too many removals (${removed_count}). Inspect conflicts."
   fi
 
-  ok "Guard rails passed (no critical removals; removals <= 20)."
+  ok "Guard rails passed."
 }
 
 convert_apply() {
   [[ "$ACCEPT_RISK" == "yes" ]] || die "You must pass --i-accept-the-risk to run convert."
-
   preflight_common
 
   if [[ "$ASSUME_YES" != "yes" ]]; then
@@ -523,7 +521,6 @@ convert_apply() {
   backup_dir="$(backup_system_state)"
   timeshift_snapshot_best_effort
 
-  # Quiet apt timers that can race us
   systemctl stop apt-daily.service apt-daily-upgrade.service 2>/dev/null || true
   systemctl kill --kill-who=all apt-daily.service apt-daily-upgrade.service 2>/dev/null || true
 
@@ -537,7 +534,6 @@ convert_apply() {
   write_mint_sources_system
   write_mint_pinning_system
 
-  # Update + simulate real install on the real system (but still simulation first)
   info "APT update..."
   DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::Retries=3 update
 
@@ -550,18 +546,13 @@ convert_apply() {
     mate)     pkgs+=(mint-meta-mate) ;;
     xfce)     pkgs+=(mint-meta-xfce) ;;
   esac
-  # keep this minimal; meta packages can be large – avoid recommends by default
-  pkgs+=(mint-meta-core mintsystem mintupdate mintsources)
-
-  # Optional codecs (often desired, but can pull extra) – keep it but still no recommends
-  pkgs+=(mint-meta-codecs)
+  pkgs+=(mint-meta-core mintsystem mintupdate mintsources mint-meta-codecs)
 
   info "Simulation (safety check) of install: ${pkgs[*]}"
   local sim_out="${backup_dir}/apt-sim-install.txt"
   DEBIAN_FRONTEND=noninteractive apt-get -s install $recommends "${pkgs[@]}" | tee "$sim_out" >/dev/null
   parse_and_guard_apt_actions "$sim_out"
 
-  # Execute install
   info "Installing Mint packages..."
   export DEBIAN_FRONTEND=noninteractive
   export NEEDRESTART_MODE=a
@@ -571,7 +562,6 @@ convert_apply() {
     $recommends \
     "${pkgs[@]}"
 
-  # Preserve Snap (Mint often pins snapd; we undo that if it appears and user asked to preserve)
   if [[ "$PRESERVE_SNAP" == "yes" ]]; then
     local nosnap="/etc/apt/preferences.d/nosnap.pref"
     if [[ -f "$nosnap" ]]; then
@@ -580,12 +570,6 @@ convert_apply() {
       apt-get -o Acquire::Retries=3 update
     fi
   fi
-
-  # Post-checks
-  info "Post-checks:"
-  apt-cache policy mintsystem | sed 's/^/  /' || true
-  if have_cmd cinnamon; then cinnamon --version | sed 's/^/  /' || true; fi
-  if have_cmd nemo; then nemo --version | sed 's/^/  /' || true; fi
 
   ok "Conversion complete (Option B)."
   info "Backup dir: ${backup_dir}"
@@ -599,7 +583,7 @@ convert_apply() {
 
 rollback_apply() {
   need_root
-  local backup_dir="${2:-}"
+  local backup_dir="${1:-}"
   [[ -n "$backup_dir" ]] || die "rollback requires a backup dir argument."
   [[ -d "$backup_dir" ]] || die "No such backup dir: $backup_dir"
   [[ -d "${backup_dir}/etc/apt" ]] || die "Backup dir missing etc/apt: $backup_dir"
@@ -608,7 +592,6 @@ rollback_apply() {
   rm -rf /etc/apt
   cp -a "${backup_dir}/etc/apt" /etc/apt
 
-  # Restore disabled sources if present
   if [[ -d "${backup_dir}/disabled-sources" ]]; then
     info "Restoring disabled sources from ${backup_dir}/disabled-sources"
     mkdir -p /etc/apt/sources.list.d
@@ -618,7 +601,7 @@ rollback_apply() {
   info "APT update after rollback..."
   DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::Retries=3 update || true
   ok "Rollback of APT configuration completed."
-  info "Note: This does NOT automatically remove Mint-installed packages. Use Timeshift/snapshot to fully revert the system state."
+  info "Note: This does NOT automatically remove Mint-installed packages. Use Timeshift/snapshot to fully revert system state."
 }
 
 main() {
@@ -628,14 +611,13 @@ main() {
       ;;
     plan)
       preflight_common
-      # plan requires keyring already present (or run convert once to install it)
       apt_simulate_with_temp_sources
       ;;
     convert)
       convert_apply
       ;;
     rollback)
-      rollback_apply "$MODE" "$2"
+      rollback_apply "${2:-}"
       ;;
     *)
       usage
@@ -644,4 +626,4 @@ main() {
   esac
 }
 
-main
+main "$@"
