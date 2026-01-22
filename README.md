@@ -57,7 +57,11 @@ Plan mode simulates the APT changes and writes a log under `/var/log/ubuntu-to-m
 sudo bash ubuntu-to-mint-convert-v3.sh plan --edition cinnamon
 ```
 
-> Note: plan mode expects the Mint repo keyring to exist. If you haven’t run `convert` before, install the key or run convert on a test machine first.
+Plan mode simulates APT changes using a **temporary APT environment** (it does not modify your system’s APT sources).
+It will fetch the Linux Mint repository signing key into a **temporary keyring** for the simulation.
+
+> Note: If `gnupg`/`dirmngr` are missing, plan mode may install them so it can import and dearmor the Mint signing key.
+> No repository files on your system are changed by plan mode.
 
 ### 3) Run conversion
 
