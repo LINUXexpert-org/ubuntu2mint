@@ -57,12 +57,14 @@ ON_ERROR_BACKUP_HINT=""
 on_err() {
   local line="${1:-?}" code="${2:-?}"
   echo "${RED}FAILED${NC} at line ${line} (exit ${code})." >&2
+  echo "Command: ${BASH_COMMAND}" >&2
   if [[ -n "${ON_ERROR_BACKUP_HINT}" ]]; then
     echo "Rollback hint: ${ON_ERROR_BACKUP_HINT}" >&2
   fi
   echo "Log: ${LOG_FILE}" >&2
   exit "$code"
 }
+
 trap 'on_err "$LINENO" "$?"' ERR
 
 need_root() { [[ ${EUID:-$(id -u)} -eq 0 ]] || die "Run as root (use sudo)."; }
@@ -408,14 +410,12 @@ timeshift_snapshot_best_effort() {
 # ---------------------------------------
 apt_simulate_with_temp_sources() {
   # Plan mode: simulate using a temporary APT environment.
-  # NOTE: This does not change system APT sources. It MAY install gnupg/dirmngr if missing,
-  # because we need to fetch and dearmor the Mint repo key for signed-by verification.
+  # This does NOT modify system APT sources.
+  # It keeps system trust/key config intact and only overrides the sources list + state/cache dirs.
 
   local tmp
   tmp="$(mktemp -d)"
   mkdir -p \
-    "$tmp/etc/apt/sources.list.d" \
-    "$tmp/etc/apt/preferences.d" \
     "$tmp/var/lib/apt/lists/partial" \
     "$tmp/var/cache/apt/archives/partial" \
     "$tmp/usr/share/keyrings"
@@ -426,36 +426,14 @@ apt_simulate_with_temp_sources() {
 
   detect_ubuntu_mirrors
 
-  cat > "$tmp/etc/apt/sources.list" <<EOF
+  local sources="$tmp/sources.list"
+  cat > "$sources" <<EOF
 deb [signed-by=${temp_keyring}] ${MINT_MIRROR%/} ${TARGET_MINT} main upstream import backport
 deb ${UBUNTU_ARCHIVE_MIRROR%/} ${UBUNTU_BASE} main restricted universe multiverse
 deb ${UBUNTU_ARCHIVE_MIRROR%/} ${UBUNTU_BASE}-updates main restricted universe multiverse
 deb ${UBUNTU_ARCHIVE_MIRROR%/} ${UBUNTU_BASE}-backports main restricted universe multiverse
 deb ${UBUNTU_SECURITY_MIRROR%/} ${UBUNTU_BASE}-security main restricted universe multiverse
 EOF
-
-  cat > "$tmp/etc/apt/preferences.d/50-linuxmint-conversion.pref" <<'EOF'
-Package: *
-Pin: origin "packages.linuxmint.com"
-Pin-Priority: 100
-
-Package: mint* mintsources* mintupdate* mintsystem* mintstick* mintmenu* mintlocale* mintdrivers* mintreport* mintwelcome*
-Pin: origin "packages.linuxmint.com"
-Pin-Priority: 700
-
-Package: cinnamon* nemo* muffin* cjs* xapp* slick-greeter* lightdm* pix* xviewer* mint-themes* mint-y-icons* mint-x-icons*
-Pin: origin "packages.linuxmint.com"
-Pin-Priority: 700
-EOF
-
-  info "Plan mode: apt update (temporary dirs)..."
-  apt-get \
-    -o Dir::Etc="$tmp/etc/apt" \
-    -o Dir::State="$tmp/var/lib/apt" \
-    -o Dir::Cache="$tmp/var/cache/apt" \
-    -o Dir::State::status="/var/lib/dpkg/status" \
-    -o Acquire::Retries=3 \
-    update
 
   local recommends="--no-install-recommends"
   [[ "$WITH_RECOMMENDS" == "yes" ]] && recommends=""
@@ -468,10 +446,21 @@ EOF
   esac
   pkgs+=(mint-meta-core mint-meta-codecs mintsystem mintupdate mintsources)
 
+  info "Plan mode: apt update (temporary state/cache + temporary sources list)..."
+  apt-get \
+    -o Dir::Etc::sourcelist="$sources" \
+    -o Dir::Etc::sourceparts="-" \
+    -o Dir::State="$tmp/var/lib/apt" \
+    -o Dir::Cache="$tmp/var/cache/apt" \
+    -o Dir::State::status="/var/lib/dpkg/status" \
+    -o Acquire::Retries=3 \
+    update
+
   info "Plan mode: simulated install: ${pkgs[*]}"
   local plan_log="$LOG_DIR/plan-$(date +%Y%m%d-%H%M%S).txt"
   apt-get \
-    -o Dir::Etc="$tmp/etc/apt" \
+    -o Dir::Etc::sourcelist="$sources" \
+    -o Dir::Etc::sourceparts="-" \
     -o Dir::State="$tmp/var/lib/apt" \
     -o Dir::Cache="$tmp/var/cache/apt" \
     -o Dir::State::status="/var/lib/dpkg/status" \
@@ -481,6 +470,7 @@ EOF
   rm -rf "$tmp"
   ok "Plan completed. Review: $plan_log"
 }
+
 
 parse_and_guard_apt_actions() {
   local sim_output_file="$1"
