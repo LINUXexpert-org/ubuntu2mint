@@ -144,7 +144,7 @@ sudo bash ubuntu-to-mint-convert-v3.sh rollback /root/ubuntu-to-mint-backup-YYYY
   * Ubuntu `jammy`: `virginia`, `victoria`, `vera`, `vanessa`
 
 * `--mint-mirror <url>`
-  Override Mint mirror base URL (default: `https://packages.linuxmint.com`).
+  Override Mint mirror base URL (default: `http://packages.linuxmint.com`).
 
 ### Safety / APT behavior
 
