@@ -300,38 +300,39 @@ mint_repo_key_write_to() {
   elif gpg --homedir "$gnupghome" --batch --keyserver hkp://keyserver.ubuntu.com:80 --recv-keys "$keyid" >/dev/null 2>&1; then
     :
   else
-  # 3) Fallback: fetch armored key over HTTPS/HTTP and dearmor
-info "Keyserver blocked; fetching key over HTTPS from Ubuntu keyserver..."
-local armored="$gnupghome/linuxmint-repo.asc"
+    # 3) Fallback: fetch armored key over HTTPS/HTTP and dearmor
+    info "Keyserver blocked; fetching key over HTTPS from Ubuntu keyserver..."
+    local armored="$gnupghome/linuxmint-repo.asc"
 
-if ! curl -fsSL "https://keyserver.ubuntu.com/pks/lookup?op=get&search=0x${keyid}" -o "$armored"; then
-  curl -fsSL "http://keyserver.ubuntu.com/pks/lookup?op=get&search=0x${keyid}" -o "$armored" \
-    || die "Unable to fetch Mint repo key via keyserver or HTTPS fallback."
-fi
+    if ! curl -fsSL "https://keyserver.ubuntu.com/pks/lookup?op=get&search=0x${keyid}" -o "$armored"; then
+      curl -fsSL "http://keyserver.ubuntu.com/pks/lookup?op=get&search=0x${keyid}" -o "$armored" \
+        || die "Unable to fetch Mint repo key via keyserver or HTTPS fallback."
+    fi
 
-# Sanity: ensure it's a PGP public key block
-grep -q "BEGIN PGP PUBLIC KEY BLOCK" "$armored" || die "Downloaded key is not a PGP public key block (proxy portal/HTML?)"
+    # Sanity: ensure it's a PGP public key block (avoid proxy HTML portals)
+    grep -q "BEGIN PGP PUBLIC KEY BLOCK" "$armored" \
+      || die "Downloaded key is not a PGP public key block (proxy portal/HTML?)"
 
-# Validate: the expected keyid appears in the key block (pub OR sub)
-local found="no"
-while IFS= read -r kid; do
-  if [[ "${kid^^}" == "${keyid^^}" ]]; then
-    found="yes"
-    break
-  fi
-done < <(gpg --batch --with-colons --show-keys "$armored" | awk -F: '$1=="pub"||$1=="sub"{print $5}')
+    # Validate: the expected keyid appears in the key block (pub OR sub)
+    local found="no"
+    while IFS= read -r kid; do
+      if [[ "${kid^^}" == "${keyid^^}" ]]; then
+        found="yes"
+        break
+      fi
+    done < <(gpg --batch --with-colons --show-keys "$armored" | awk -F: '$1=="pub"||$1=="sub"{print $5}')
 
-[[ "$found" == "yes" ]] || die "Fetched key does not contain expected keyid ${keyid^^}"
+    [[ "$found" == "yes" ]] || die "Fetched key does not contain expected keyid ${keyid^^}"
 
-# (Optional) extra guard: make sure the UID looks like Linux Mint repo key
-if ! gpg --batch --with-colons --show-keys "$armored" | awk -F: '$1=="uid"{print $10}' | grep -qi "Linux Mint Repository Signing Key"; then
-  warn "Keyid matched but UID did not match expected Mint repo UID; review /tmp key block if concerned."
-fi
+    # Optional guard: check UID contains expected label
+    if ! gpg --batch --with-colons --show-keys "$armored" | awk -F: '$1=="uid"{print $10}' | grep -qi "Linux Mint Repository Signing Key"; then
+      warn "Keyid matched but UID did not match expected Mint repo UID; review the downloaded key if concerned."
+    fi
 
-gpg --batch --dearmor -o "$out_keyring" "$armored"
-chmod 644 "$out_keyring"
-rm -rf "$gnupghome"
-return 0
+    gpg --batch --dearmor -o "$out_keyring" "$armored"
+    chmod 644 "$out_keyring"
+    rm -rf "$gnupghome"
+    return 0
   fi
 
   # If we got here, gpg received the key into temp keyring; export+dearmor
@@ -339,7 +340,6 @@ return 0
   chmod 644 "$out_keyring"
   rm -rf "$gnupghome"
 }
-
 
 mint_repo_key_install() {
   local keyring="/usr/share/keyrings/linuxmint-repo.gpg"
@@ -381,21 +381,39 @@ write_mint_pinning_system() {
   info "Writing conservative APT pinning to ${pref}"
 
   cat > "$pref" <<'EOF'
+# Default: do NOT prefer Mint for everything.
 Package: *
-Pin: origin "packages.linuxmint.com"
+Pin: release o=LinuxMint
 Pin-Priority: 100
 
+# Prefer Mint for Mint tooling
 Package: mint* mintsources* mintupdate* mintsystem* mintstick* mintmenu* mintlocale* mintdrivers* mintreport* mintwelcome*
-Pin: origin "packages.linuxmint.com"
+Pin: release o=LinuxMint
 Pin-Priority: 700
 
-Package: cinnamon* nemo* muffin* cjs* xapp* slick-greeter* lightdm* pix* xviewer* mint-themes* mint-y-icons* mint-x-icons*
-Pin: origin "packages.linuxmint.com"
-Pin-Priority: 700
+# Prefer Mint for Cinnamon/Nemo stack (apps)
+Package: cinnamon* nemo* muffin* cjs* slick-greeter* lightdm* pix* xviewer* mint-themes* mint-y-icons* mint-x-icons*
+Pin: release o=LinuxMint
+Pin-Priority: 900
+
+# Prefer Mint for XApp stack (critical deps for mintreport + nemo/cinnamon)
+Package: python3-xapp* python-xapp* libxapp* gir1.2-xapp* xapps* xapps-common xapp-symbolic-icons xapp-status-icon
+Pin: release o=LinuxMint
+Pin-Priority: 1001
+
+# Prefer Mint for Cinnamon/Nemo libraries that must match exact versions
+Package: libnemo-extension1* nemo-data*
+Pin: release o=LinuxMint
+Pin-Priority: 1001
+
+Package: libcinnamon-control-center1* libcinnamon-menu-3-0* libcinnamon-desktop4* cinnamon-desktop-data* cinnamon-control-center-data* cinnamon-l10n*
+Pin: release o=LinuxMint
+Pin-Priority: 1001
 EOF
 
   ok "Pinning written."
 }
+
 
 disable_thirdparty_sources_system() {
   local backup_dir="$1"
@@ -404,14 +422,25 @@ disable_thirdparty_sources_system() {
 
   info "Disabling 3rd-party sources into: ${disabled_dir}"
   shopt -s nullglob
+
+  local allow_re='(crowdstrike|falcon|globalprotect|paloalto|pan(gp)?|cortex|prisma)'
+
   for f in /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources; do
     [[ "$(basename "$f")" == "official-package-repositories.list" ]] && continue
+
+    # Preserve known security/VPN vendor repos
+    if echo "$(basename "$f")" | grep -Eiq "$allow_re" || grep -Eiq "$allow_re" "$f"; then
+      info "Preserving vendor repo: $f"
+      continue
+    fi
+
     mv -v "$f" "${disabled_dir}/" || true
   done
-  shopt -u nullglob
 
+  shopt -u nullglob
   ok "Third-party sources disabled (restorable via rollback)."
 }
+
 
 backup_system_state() {
   local backup_dir="/root/ubuntu-to-mint-backup-$(date +%Y%m%d-%H%M%S)"
