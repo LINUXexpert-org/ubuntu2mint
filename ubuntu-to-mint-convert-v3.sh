@@ -42,7 +42,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 umask 022
 
-SCRIPT_VERSION="4.2"
+SCRIPT_VERSION="4.3"
 
 LOG_DIR="/var/log/ubuntu-to-mint"
 mkdir -p "$LOG_DIR"
@@ -424,6 +424,7 @@ backup_existing_keyring() {
 
 # -------------------------
 # Key handling (HKPS -> HKP:80 -> HTTPS fallback) + atomic write (same dir)
+# FIXED: do not dearmor to an already-existing file; validate OpenPGP data
 # -------------------------
 mint_repo_key_write_to() {
   # mint_repo_key_write_to <out_keyring> <allow_changes yes|no>
@@ -438,10 +439,10 @@ mint_repo_key_write_to() {
   out_dir="$(dirname "$out_keyring")"
   mkdir -p "$out_dir"
 
-  # Atomicity: temp file in SAME directory as out_keyring
-  local tmp_out
-  tmp_out="$(mktemp -p "$out_dir" ".linuxmint-repo.gpg.tmp.XXXXXX")"
-  chmod 600 "$tmp_out"
+  # Temp dir on same filesystem for atomic mv; output file does NOT exist yet.
+  local tmp_dir tmp_out
+  tmp_dir="$(mktemp -d -p "$out_dir" ".linuxmint-repo.gpg.tmp.XXXXXX")"
+  tmp_out="${tmp_dir}/linuxmint-repo.gpg"
 
   local gnupghome
   gnupghome="$(mktemp -d)"
@@ -459,46 +460,48 @@ mint_repo_key_write_to() {
     got="yes"
   elif gpg --homedir "$gnupghome" --batch "${ks_opts[@]}" --keyserver hkp://keyserver.ubuntu.com:80 --recv-keys "$keyid" >/dev/null 2>&1; then
     got="yes"
-  else
-    got="no"
   fi
 
   if [[ "$got" == "yes" ]]; then
-    if ! gpg --homedir "$gnupghome" --batch --export "$keyid" | gpg --batch --dearmor -o "$tmp_out"; then
-      rm -rf "$gnupghome"
-      rm -f "$tmp_out"
-      die "Failed to export+dearmor the Mint repo key from keyserver results."
-    fi
+    gpg --homedir "$gnupghome" --batch --export "$keyid" \
+      | gpg --batch --yes --dearmor -o "$tmp_out" \
+      || { rm -rf "$gnupghome" "$tmp_dir"; die "Failed to export+dearmor Mint repo key from keyserver."; }
   else
     info "Keyserver blocked; fetching key over HTTPS from Ubuntu keyserver (exact match)..."
     local armored="$gnupghome/linuxmint-repo.asc"
 
     if ! curl -fsSL --connect-timeout 10 --max-time 30 \
+        -H "Accept: application/pgp-keys" \
         "https://keyserver.ubuntu.com/pks/lookup?op=get&search=0x${keyid}&exact=on" -o "$armored"; then
       curl -fsSL --connect-timeout 10 --max-time 30 \
+        -H "Accept: application/pgp-keys" \
         "http://keyserver.ubuntu.com/pks/lookup?op=get&search=0x${keyid}&exact=on" -o "$armored" \
-        || die "Unable to fetch Mint repo key via keyserver or HTTPS fallback."
+        || { rm -rf "$gnupghome" "$tmp_dir"; die "Unable to fetch Mint repo key via keyserver or HTTPS fallback."; }
     fi
 
     grep -q "BEGIN PGP PUBLIC KEY BLOCK" "$armored" \
-      || die "Downloaded key is not a PGP public key block (proxy portal/HTML?)"
+      || { rm -rf "$gnupghome" "$tmp_dir"; die "Downloaded content is not a PGP public key block (proxy portal/HTML?)."; }
 
-    local found="no"
-    while IFS= read -r kid; do
-      [[ "${kid^^}" == "${keyid^^}" ]] && found="yes" && break
-    done < <(gpg --batch --with-colons --show-keys "$armored" | awk -F: '$1=="pub"||$1=="sub"{print $5}')
+    local keyinfo
+    if ! keyinfo="$(gpg --batch --with-colons --show-keys "$armored" 2>/dev/null)"; then
+      rm -rf "$gnupghome" "$tmp_dir"
+      die "Downloaded key block is not valid OpenPGP data (gpg cannot parse it)."
+    fi
 
-    [[ "$found" == "yes" ]] || die "Fetched key does not contain expected keyid ${keyid^^}"
+    if ! awk -F: '$1=="pub"||$1=="sub"{print toupper($5)}' <<<"$keyinfo" | grep -q "${keyid^^}"; then
+      rm -rf "$gnupghome" "$tmp_dir"
+      die "Fetched key does not contain expected keyid ${keyid^^}"
+    fi
 
-    gpg --batch --dearmor -o "$tmp_out" "$armored"
+    gpg --batch --yes --dearmor -o "$tmp_out" "$armored" \
+      || { rm -rf "$gnupghome" "$tmp_dir"; die "Failed to dearmor downloaded key block."; }
   fi
 
   chmod 644 "$tmp_out"
   mv -f "$tmp_out" "$out_keyring"
   chmod 644 "$out_keyring"
-  rm -rf "$gnupghome"
+  rm -rf "$gnupghome" "$tmp_dir"
 
-  # Post-write fingerprint logging + optional hard check
   local fpr
   fpr="$(get_key_fingerprint_from_keyring "$out_keyring" || true)"
   [[ -n "$fpr" ]] || die "Unable to read fingerprint from written keyring: $out_keyring"
@@ -782,10 +785,6 @@ find_session_name_for_edition() {
 
   local sess=""
 
-  # If user asked for Wayland, try to find a LightDM-compatible session FIRST.
-  # Note: Most Wayland sessions ship under /usr/share/wayland-sessions and are
-  # typically intended for GDM. Since this script standardizes on LightDM, we only
-  # select Wayland if it appears as an Xsession.
   if [[ "$prefer_wayland" == "yes" ]]; then
     local -a way_candidates=()
     case "$desired" in
@@ -807,7 +806,6 @@ find_session_name_for_edition() {
     done
   fi
 
-  # Default / safer: X11 session candidates
   local -a candidates=()
   case "$desired" in
     cinnamon) candidates=(cinnamon cinnamon2d) ;;
@@ -1090,7 +1088,6 @@ deb ${UBUNTU_SECURITY_MIRROR%/} ${UBUNTU_BASE}-security main restricted universe
 EOF
 
   mkdir -p "$tmp/etc/apt/preferences.d"
-  # Use the same pinning logic as convert
   cat > "$tmp/etc/apt/preferences.d/50-linuxmint-conversion.pref" <<'EOF'
 Package: *
 Pin: release o=LinuxMint
@@ -1183,9 +1180,7 @@ EOF
 convert_apply() {
   [[ "$ACCEPT_RISK" == "yes" ]] || die "You must pass --i-accept-the-risk to run convert."
 
-  # Disclaimer is required only for convert (per request)
   require_unsupported_disclaimer
-
   preflight_common "yes"
 
   if [[ "$ASSUME_YES" != "yes" ]]; then
@@ -1215,7 +1210,6 @@ convert_apply() {
     fi
   fi
 
-  # Preseed display manager selection early (reduces DM prompt/flip-flops)
   DEBIAN_FRONTEND=noninteractive apt-get -y install debconf-utils || true
   if have_cmd debconf-set-selections; then
     echo "lightdm shared/default-x-display-manager select lightdm" | debconf-set-selections || true
