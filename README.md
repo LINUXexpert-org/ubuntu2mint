@@ -10,7 +10,7 @@ This project is intended for experienced Linux admins who understand APT, repo p
 
 
 
-## What changed in the latest script (v4.2)
+## What changed in the latest script (v4.3)
 
 - **Convert-only “unsupported migration” disclaimer gate** (requires typing: `I UNDERSTAND THIS IS UNSUPPORTED`)
 - Defaults to **LightDM + slick-greeter** and explicitly sets the **default desktop session**
