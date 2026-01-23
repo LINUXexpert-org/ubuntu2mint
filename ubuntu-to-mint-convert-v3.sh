@@ -300,24 +300,38 @@ mint_repo_key_write_to() {
   elif gpg --homedir "$gnupghome" --batch --keyserver hkp://keyserver.ubuntu.com:80 --recv-keys "$keyid" >/dev/null 2>&1; then
     :
   else
-    # 3) Fallback: fetch armored key over HTTPS/HTTP and dearmor
-    info "Keyserver blocked; fetching key over HTTPS from Ubuntu keyserver..."
-    local armored="$gnupghome/linuxmint-repo.asc"
+  # 3) Fallback: fetch armored key over HTTPS/HTTP and dearmor
+info "Keyserver blocked; fetching key over HTTPS from Ubuntu keyserver..."
+local armored="$gnupghome/linuxmint-repo.asc"
 
-    if ! curl -fsSL "https://keyserver.ubuntu.com/pks/lookup?op=get&search=0x${keyid}" -o "$armored"; then
-      curl -fsSL "http://keyserver.ubuntu.com/pks/lookup?op=get&search=0x${keyid}" -o "$armored" \
-        || die "Unable to fetch Mint repo key via keyserver or HTTPS fallback."
-    fi
+if ! curl -fsSL "https://keyserver.ubuntu.com/pks/lookup?op=get&search=0x${keyid}" -o "$armored"; then
+  curl -fsSL "http://keyserver.ubuntu.com/pks/lookup?op=get&search=0x${keyid}" -o "$armored" \
+    || die "Unable to fetch Mint repo key via keyserver or HTTPS fallback."
+fi
 
-    # Basic safety check: ensure the fetched key contains the expected key id (last 16 hex of fingerprint)
-    local fpr_last16
-    fpr_last16="$(gpg --batch --with-colons --show-keys "$armored" | awk -F: '$1=="fpr"{print $10}' | tail -n1 | tail -c 17 | tr -d '\n' | tr '[:lower:]' '[:upper:]')"
-    [[ "$fpr_last16" == "${keyid^^}" ]] || die "Fetched key fingerprint suffix mismatch (expected ${keyid^^}, got ${fpr_last16:-<none>})."
+# Sanity: ensure it's a PGP public key block
+grep -q "BEGIN PGP PUBLIC KEY BLOCK" "$armored" || die "Downloaded key is not a PGP public key block (proxy portal/HTML?)"
 
-    gpg --batch --dearmor -o "$out_keyring" "$armored"
-    chmod 644 "$out_keyring"
-    rm -rf "$gnupghome"
-    return 0
+# Validate: the expected keyid appears in the key block (pub OR sub)
+local found="no"
+while IFS= read -r kid; do
+  if [[ "${kid^^}" == "${keyid^^}" ]]; then
+    found="yes"
+    break
+  fi
+done < <(gpg --batch --with-colons --show-keys "$armored" | awk -F: '$1=="pub"||$1=="sub"{print $5}')
+
+[[ "$found" == "yes" ]] || die "Fetched key does not contain expected keyid ${keyid^^}"
+
+# (Optional) extra guard: make sure the UID looks like Linux Mint repo key
+if ! gpg --batch --with-colons --show-keys "$armored" | awk -F: '$1=="uid"{print $10}' | grep -qi "Linux Mint Repository Signing Key"; then
+  warn "Keyid matched but UID did not match expected Mint repo UID; review /tmp key block if concerned."
+fi
+
+gpg --batch --dearmor -o "$out_keyring" "$armored"
+chmod 644 "$out_keyring"
+rm -rf "$gnupghome"
+return 0
   fi
 
   # If we got here, gpg received the key into temp keyring; export+dearmor
