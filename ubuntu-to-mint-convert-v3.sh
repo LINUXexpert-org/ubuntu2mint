@@ -118,7 +118,7 @@ Options:
   --i-accept-the-risk                   (required for convert)
   --edition cinnamon|mate|xfce          (default: cinnamon)
   --target  zena|zara|xia|wilma|virginia|victoria|vera|vanessa
-  --mint-mirror URL                     (default: https://packages.linuxmint.com)
+  --mint-mirror URL                     (default: http://packages.linuxmint.com)
   --keep-ppas                           (do not disable 3rd-party repos; higher conflict risk)
   --allow-unhold                        (temporarily unhold packages during convert; risky)
   --preserve-snap                       (default: yes)
@@ -148,7 +148,7 @@ fi
 
 EDITION="cinnamon"
 TARGET_MINT=""
-MINT_MIRROR="https://packages.linuxmint.com"
+MINT_MIRROR="http://packages.linuxmint.com"
 KEEP_PPAS="no"
 ALLOW_UNHOLD="no"
 PRESERVE_SNAP="yes"
