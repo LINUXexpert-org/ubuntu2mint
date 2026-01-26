@@ -20,7 +20,7 @@ set -euo pipefail
 # =========================
 # Version
 # =========================
-SCRIPT_VERSION="4.9"
+SCRIPT_VERSION="5.0"
 
 # =========================
 # Globals / Defaults
@@ -28,7 +28,6 @@ SCRIPT_VERSION="4.9"
 LOG_DIR="/var/log/ubuntu-to-mint"
 mkdir -p "$LOG_DIR"
 LOG_FILE="${LOG_DIR}/ubuntu-to-mint-$(date +%Y%m%d-%H%M%S).log"
-
 exec > >(tee -a "$LOG_FILE") 2>&1
 
 # CLI defaults
@@ -225,6 +224,7 @@ backup_system_state() {
   cp -a /etc/fstab /etc/hostname /etc/hosts 2>/dev/null "${backup_dir}/etc/" || true
   cp -a /etc/lightdm 2>/dev/null "${backup_dir}/etc/" || true
   cp -a /etc/X11/default-display-manager 2>/dev/null "${backup_dir}/etc/" || true
+  cp -a /etc/systemd/system/display-manager.service 2>/dev/null "${backup_dir}/etc/" || true
 
   dpkg-query -W -f='${Package}\t${Version}\n' > "${backup_dir}/dpkg-packages.tsv" || true
   apt-mark showmanual > "${backup_dir}/apt-manual.txt" || true
@@ -283,7 +283,6 @@ gpg_key_file_has_keyid() {
 }
 
 ubuntu_archive_keyring_path() {
-  # Needed for plan mode temp APT root signature verification.
   DEBIAN_FRONTEND=noninteractive apt-get install -y ubuntu-keyring >/dev/null 2>&1 || true
   if [[ -r /usr/share/keyrings/ubuntu-archive-keyring.gpg ]]; then
     echo "/usr/share/keyrings/ubuntu-archive-keyring.gpg"
@@ -511,31 +510,73 @@ session_name_for_edition() {
   esac
 }
 
+verify_session_desktop_exists() {
+  local sess="$1"
+  local f="/usr/share/xsessions/${sess}.desktop"
+  if [[ -f "$f" ]]; then
+    ok "Session desktop present: $f"
+    return 0
+  fi
+  warn "Expected session desktop missing: $f"
+  return 1
+}
+
+force_display_manager_symlink() {
+  # Some systems end up with display-manager.service still pointing to gdm3 (or missing).
+  # LightDM's unit typically provides Alias=display-manager.service, but we enforce if needed.
+  if [[ -d /run/systemd/system ]]; then
+    if [[ -f /lib/systemd/system/lightdm.service ]]; then
+      mkdir -p /etc/systemd/system
+      ln -sf /lib/systemd/system/lightdm.service /etc/systemd/system/display-manager.service || true
+    fi
+  fi
+}
+
 ensure_lightdm_on_boot() {
   if [[ ! -d /run/systemd/system ]]; then
     warn "systemd not detected; cannot enable LightDM on boot in this environment."
     return 0
   fi
 
-  info "Ensuring LightDM starts on boot (graphical.target + default display manager)..."
+  info "Ensuring LightDM starts on boot (graphical.target + display-manager.service)..."
 
+  # Ensure packages exist
+  DEBIAN_FRONTEND=noninteractive apt-get install -y lightdm slick-greeter >/dev/null 2>&1 || true
+
+  # Unmask anything that could block startup
   systemctl unmask lightdm >/dev/null 2>&1 || true
-  echo "/usr/sbin/lightdm" > /etc/X11/default-display-manager || true
+  systemctl unmask display-manager >/dev/null 2>&1 || true
 
+  # Boot to graphical target
+  systemctl set-default graphical.target >/dev/null 2>&1 || true
+  systemctl enable graphical.target >/dev/null 2>&1 || true
+
+  # Force default display manager selection (Debian/Ubuntu mechanism)
+  echo "/usr/sbin/lightdm" > /etc/X11/default-display-manager || true
   if have_cmd update-alternatives; then
     update-alternatives --set x-display-manager /usr/sbin/lightdm >/dev/null 2>&1 || true
   fi
 
-  systemctl set-default graphical.target >/dev/null 2>&1 || true
-  systemctl enable graphical.target >/dev/null 2>&1 || true
-  systemctl enable lightdm >/dev/null 2>&1 || true
-
+  # If GDM exists, disable it so it can't steal the login screen
   if systemctl list-unit-files | awk '{print $1}' | grep -qx 'gdm3.service'; then
     systemctl disable --now gdm3 >/dev/null 2>&1 || true
     systemctl mask gdm3 >/dev/null 2>&1 || true
   fi
 
+  # Ensure the display-manager alias points to lightdm
+  force_display_manager_symlink
+
+  # Enable BOTH: LightDM and the alias used by the system
+  systemctl daemon-reload >/dev/null 2>&1 || true
+  systemctl enable lightdm >/dev/null 2>&1 || true
+  systemctl enable display-manager >/dev/null 2>&1 || true
+
+  # Recreate enablement links (helps when units were swapped previously)
+  systemctl reenable lightdm >/dev/null 2>&1 || true
+
+  # Start now (best-effort)
   systemctl restart lightdm >/dev/null 2>&1 || true
+
   ok "LightDM configured to start on boot."
 }
 
@@ -597,6 +638,9 @@ EOF
     chmod 644 "$dmrc" || true
   done
 
+  # Ensure the selected session exists (warn only; convert should still proceed)
+  verify_session_desktop_exists "$sess" || true
+
   ensure_lightdm_on_boot
   ok "LightDM defaults applied; default session set to ${sess}."
 }
@@ -636,15 +680,63 @@ post_install_sanity() {
       echo "FAIL"
     fi
     echo
-    echo "LightDM boot settings:"
+    echo "Boot/display settings:"
     echo "default-display-manager: $(cat /etc/X11/default-display-manager 2>/dev/null || echo MISSING)"
-    echo "lightdm enabled: $(systemctl is-enabled lightdm 2>/dev/null || echo unknown)"
-    echo "gdm3 enabled: $(systemctl is-enabled gdm3 2>/dev/null || echo not-installed)"
     echo "default target: $(systemctl get-default 2>/dev/null || echo unknown)"
+    echo "lightdm enabled: $(systemctl is-enabled lightdm 2>/dev/null || echo unknown)"
+    echo "display-manager enabled: $(systemctl is-enabled display-manager 2>/dev/null || echo unknown)"
+    echo "gdm3 enabled: $(systemctl is-enabled gdm3 2>/dev/null || echo not-installed)"
+    echo
+    echo "display-manager.service link:"
+    ls -l /etc/systemd/system/display-manager.service 2>/dev/null || true
     echo
   } > "$out_file"
 
   ok "Post-conversion validation written: $out_file"
+}
+
+# =========================
+# Install stack with retry (fixes "first run partial, second run completes")
+# =========================
+install_mint_stack_with_retry() {
+  local meta="$1"
+  shift || true
+
+  local -a pkgs=(
+    "$meta"
+    mint-meta-core
+    mintsystem
+    mintupdate
+    mintsources
+    mint-meta-codecs
+  )
+
+  # Make sure diversion exists BEFORE first attempt
+  apply_mintupdate_icon_diversion
+
+  local attempt rc
+  for attempt in 1 2; do
+    info "Installing Mint stack (attempt ${attempt}/2)..."
+    set +e
+    DEBIAN_FRONTEND=noninteractive apt-get $(apt_opts_common) install "${pkgs[@]}"
+    rc=$?
+    set -e
+
+    if [[ $rc -eq 0 ]]; then
+      ok "Mint stack installed successfully."
+      return 0
+    fi
+
+    warn "Mint stack install attempt ${attempt} failed (exit ${rc}). Running remediation then retrying..."
+    # Common recoveries after partial dpkg state or file conflicts:
+    apply_mintupdate_icon_diversion
+    apt_fix_broken
+
+    # Refresh lists after fixes (best-effort)
+    DEBIAN_FRONTEND=noninteractive apt-get $(apt_opts_common) update || true
+  done
+
+  die "Unable to install Mint stack after retry. See log: ${LOG_FILE}"
 }
 
 # =========================
@@ -666,7 +758,6 @@ apt_tmp_run() {
 plan_fix_tmpapt_perms() {
   local tmpapt="$1"
 
-  # Allow _apt sandbox to traverse and write partial lists
   chmod 755 "$tmpapt" || true
   chmod 755 "$tmpapt"/{etc,usr,var} 2>/dev/null || true
   chmod 755 "$tmpapt"/var/{lib,cache} 2>/dev/null || true
@@ -820,6 +911,8 @@ convert() {
   detect_os
   show_disclaimer_and_require_ack
 
+  # Always start by healing dpkg/apt — this is what makes re-runs succeed,
+  # so we do it up front to make first run succeed more often.
   apt_fix_broken
 
   local backup_dir
@@ -827,6 +920,7 @@ convert() {
   disable_thirdparty_sources_system "$backup_dir"
   timeshift_snapshot_best_effort
 
+  # Ensure we can verify Ubuntu + Mint repos deterministically
   mint_repo_key_install_system
   write_mint_sources_system
   write_mint_pinning_system
@@ -841,20 +935,19 @@ convert() {
     xfce) meta="mint-meta-xfce" ;;
   esac
 
-  apply_mintupdate_icon_diversion
-
-  info "Installing Mint meta packages and tooling..."
-  DEBIAN_FRONTEND=noninteractive apt-get $(apt_opts_common) install \
-    "$meta" mint-meta-core mintsystem mintupdate mintsources mint-meta-codecs
+  # Install Mint stack with retry+remediation (fixes partial first run)
+  install_mint_stack_with_retry "$meta"
 
   if [[ "$PRESERVE_SNAP" == "yes" ]]; then
     info "Preserving snap support (best-effort)..."
     DEBIAN_FRONTEND=noninteractive apt-get $(apt_opts_common) install snapd || true
   fi
 
+  # Fixes: /etc/X11/Xsession.d/* has_option command not found
   info "Reinstalling x11-common (fixes Xsession has_option issues)..."
   DEBIAN_FRONTEND=noninteractive apt-get $(apt_opts_common) install --reinstall x11-common || true
 
+  # Apply LightDM defaults AFTER the desktop is installed so the session exists
   ensure_lightdm_defaults
 
   mkdir -p "$backup_dir"
