@@ -20,7 +20,7 @@ set -euo pipefail
 # =========================
 # Version
 # =========================
-SCRIPT_VERSION="5.0"
+SCRIPT_VERSION="5.1"
 
 # =========================
 # Globals / Defaults
@@ -225,6 +225,7 @@ backup_system_state() {
   cp -a /etc/lightdm 2>/dev/null "${backup_dir}/etc/" || true
   cp -a /etc/X11/default-display-manager 2>/dev/null "${backup_dir}/etc/" || true
   cp -a /etc/systemd/system/display-manager.service 2>/dev/null "${backup_dir}/etc/" || true
+  cp -a /etc/systemd/system/graphical.target.wants/display-manager.service 2>/dev/null "${backup_dir}/etc/" || true
 
   dpkg-query -W -f='${Package}\t${Version}\n' > "${backup_dir}/dpkg-packages.tsv" || true
   apt-mark showmanual > "${backup_dir}/apt-manual.txt" || true
@@ -522,14 +523,31 @@ verify_session_desktop_exists() {
 }
 
 force_display_manager_symlink() {
-  # Some systems end up with display-manager.service still pointing to gdm3 (or missing).
-  # LightDM's unit typically provides Alias=display-manager.service, but we enforce if needed.
-  if [[ -d /run/systemd/system ]]; then
-    if [[ -f /lib/systemd/system/lightdm.service ]]; then
-      mkdir -p /etc/systemd/system
-      ln -sf /lib/systemd/system/lightdm.service /etc/systemd/system/display-manager.service || true
-    fi
+  # Ensure systemd can start a DM at boot by providing display-manager.service.
+  # Ubuntu 24.04 commonly stores units in /usr/lib/systemd/system (not /lib).
+  [[ -d /run/systemd/system ]] || return 0
+
+  local dm_unit=""
+  dm_unit="$(systemctl show -p FragmentPath --value lightdm.service 2>/dev/null || true)"
+
+  if [[ -z "$dm_unit" || ! -f "$dm_unit" ]]; then
+    [[ -f /usr/lib/systemd/system/lightdm.service ]] && dm_unit="/usr/lib/systemd/system/lightdm.service"
   fi
+  if [[ -z "$dm_unit" || ! -f "$dm_unit" ]]; then
+    [[ -f /lib/systemd/system/lightdm.service ]] && dm_unit="/lib/systemd/system/lightdm.service"
+  fi
+
+  if [[ -z "$dm_unit" || ! -f "$dm_unit" ]]; then
+    warn "Could not locate lightdm.service unit file; cannot create display-manager alias."
+    return 0
+  fi
+
+  mkdir -p /etc/systemd/system /etc/systemd/system/graphical.target.wants
+
+  ln -sf "$dm_unit" /etc/systemd/system/display-manager.service
+  ln -sf /etc/systemd/system/display-manager.service /etc/systemd/system/graphical.target.wants/display-manager.service
+
+  systemctl daemon-reload >/dev/null 2>&1 || true
 }
 
 ensure_lightdm_on_boot() {
@@ -563,7 +581,7 @@ ensure_lightdm_on_boot() {
     systemctl mask gdm3 >/dev/null 2>&1 || true
   fi
 
-  # Ensure the display-manager alias points to lightdm
+  # Ensure the display-manager alias exists and is wanted by graphical.target
   force_display_manager_symlink
 
   # Enable BOTH: LightDM and the alias used by the system
@@ -687,8 +705,14 @@ post_install_sanity() {
     echo "display-manager enabled: $(systemctl is-enabled display-manager 2>/dev/null || echo unknown)"
     echo "gdm3 enabled: $(systemctl is-enabled gdm3 2>/dev/null || echo not-installed)"
     echo
+    echo "display-manager alias exists: $(test -e /etc/systemd/system/display-manager.service && echo YES || echo NO)"
+    echo "graphical wants display-manager: $(test -e /etc/systemd/system/graphical.target.wants/display-manager.service && echo YES || echo NO)"
+    echo
     echo "display-manager.service link:"
     ls -l /etc/systemd/system/display-manager.service 2>/dev/null || true
+    echo
+    echo "graphical.target.wants link:"
+    ls -l /etc/systemd/system/graphical.target.wants/display-manager.service 2>/dev/null || true
     echo
   } > "$out_file"
 
@@ -728,11 +752,8 @@ install_mint_stack_with_retry() {
     fi
 
     warn "Mint stack install attempt ${attempt} failed (exit ${rc}). Running remediation then retrying..."
-    # Common recoveries after partial dpkg state or file conflicts:
     apply_mintupdate_icon_diversion
     apt_fix_broken
-
-    # Refresh lists after fixes (best-effort)
     DEBIAN_FRONTEND=noninteractive apt-get $(apt_opts_common) update || true
   done
 
@@ -758,15 +779,21 @@ apt_tmp_run() {
 plan_fix_tmpapt_perms() {
   local tmpapt="$1"
 
+  mkdir -p "${tmpapt}/var/lib/apt/lists/partial" "${tmpapt}/var/cache/apt/archives/partial" || true
+  rm -f "${tmpapt}/var/lib/apt/lists/partial/"* 2>/dev/null || true
+  rm -f "${tmpapt}/var/cache/apt/archives/partial/"* 2>/dev/null || true
+
   chmod 755 "$tmpapt" || true
   chmod 755 "$tmpapt"/{etc,usr,var} 2>/dev/null || true
   chmod 755 "$tmpapt"/var/{lib,cache} 2>/dev/null || true
   chmod 755 "$tmpapt"/var/lib/apt 2>/dev/null || true
+  chmod 755 "$tmpapt"/var/lib/apt/lists 2>/dev/null || true
   chmod 755 "$tmpapt"/var/cache/apt 2>/dev/null || true
+  chmod 755 "$tmpapt"/var/cache/apt/archives 2>/dev/null || true
 
   if id _apt >/dev/null 2>&1; then
-    chown -R _apt:root "$tmpapt/var/lib/apt/lists/partial" 2>/dev/null || true
-    chown -R _apt:root "$tmpapt/var/cache/apt/archives/partial" 2>/dev/null || true
+    chown -R _apt:root "$tmpapt/var/lib/apt/lists" 2>/dev/null || true
+    chown -R _apt:root "$tmpapt/var/cache/apt/archives" 2>/dev/null || true
     chmod 755 "$tmpapt/var/lib/apt/lists/partial" 2>/dev/null || true
     chmod 755 "$tmpapt/var/cache/apt/archives/partial" 2>/dev/null || true
   fi
@@ -792,18 +819,22 @@ plan_mode() {
   local tmp_keyring="${tmpapt}/usr/share/keyrings/linuxmint-repo.gpg"
   mint_keyring_build_from_linuxmint_keyring_deb "$tmp_keyring"
 
-  local ubuntu_keyring
-  ubuntu_keyring="$(ubuntu_archive_keyring_path)"
+  # Copy Ubuntu archive keyring into the temp tree and reference the temp copy.
+  local ubuntu_keyring_src
+  ubuntu_keyring_src="$(ubuntu_archive_keyring_path)"
+  local tmp_ubuntu_keyring="${tmpapt}/usr/share/keyrings/ubuntu-archive-keyring.gpg"
+  cp -a "$ubuntu_keyring_src" "$tmp_ubuntu_keyring" || die "Failed to copy Ubuntu keyring into plan environment."
+  chmod 0644 "$tmp_ubuntu_keyring" || true
 
   detect_ubuntu_mirrors
 
   cat > "${tmpapt}/etc/apt/sources.list" <<EOF
 deb [signed-by=${tmp_keyring}] ${MINT_MIRROR%/} ${TARGET_MINT} main upstream import backport
 
-deb [signed-by=${ubuntu_keyring}] ${UBUNTU_ARCHIVE_MIRROR%/} ${UBUNTU_BASE} main restricted universe multiverse
-deb [signed-by=${ubuntu_keyring}] ${UBUNTU_ARCHIVE_MIRROR%/} ${UBUNTU_BASE}-updates main restricted universe multiverse
-deb [signed-by=${ubuntu_keyring}] ${UBUNTU_ARCHIVE_MIRROR%/} ${UBUNTU_BASE}-backports main restricted universe multiverse
-deb [signed-by=${ubuntu_keyring}] ${UBUNTU_SECURITY_MIRROR%/} ${UBUNTU_BASE}-security main restricted universe multiverse
+deb [signed-by=${tmp_ubuntu_keyring}] ${UBUNTU_ARCHIVE_MIRROR%/} ${UBUNTU_BASE} main restricted universe multiverse
+deb [signed-by=${tmp_ubuntu_keyring}] ${UBUNTU_ARCHIVE_MIRROR%/} ${UBUNTU_BASE}-updates main restricted universe multiverse
+deb [signed-by=${tmp_ubuntu_keyring}] ${UBUNTU_ARCHIVE_MIRROR%/} ${UBUNTU_BASE}-backports main restricted universe multiverse
+deb [signed-by=${tmp_ubuntu_keyring}] ${UBUNTU_SECURITY_MIRROR%/} ${UBUNTU_BASE}-security main restricted universe multiverse
 EOF
 
   cat > "${tmpapt}/etc/apt/preferences.d/50-linuxmint-conversion.pref" <<'EOF'
@@ -820,8 +851,10 @@ Pin: origin "packages.linuxmint.com"
 Pin-Priority: 700
 EOF
 
+  plan_fix_tmpapt_perms "$tmpapt"
+
   info "APT update (plan)..."
-  apt_tmp_run "$tmpapt" update -y >/dev/null
+  apt_tmp_run "$tmpapt" update >/dev/null
 
   local meta=""
   case "$EDITION" in
@@ -911,8 +944,6 @@ convert() {
   detect_os
   show_disclaimer_and_require_ack
 
-  # Always start by healing dpkg/apt — this is what makes re-runs succeed,
-  # so we do it up front to make first run succeed more often.
   apt_fix_broken
 
   local backup_dir
@@ -920,7 +951,6 @@ convert() {
   disable_thirdparty_sources_system "$backup_dir"
   timeshift_snapshot_best_effort
 
-  # Ensure we can verify Ubuntu + Mint repos deterministically
   mint_repo_key_install_system
   write_mint_sources_system
   write_mint_pinning_system
@@ -935,7 +965,6 @@ convert() {
     xfce) meta="mint-meta-xfce" ;;
   esac
 
-  # Install Mint stack with retry+remediation (fixes partial first run)
   install_mint_stack_with_retry "$meta"
 
   if [[ "$PRESERVE_SNAP" == "yes" ]]; then
@@ -943,11 +972,9 @@ convert() {
     DEBIAN_FRONTEND=noninteractive apt-get $(apt_opts_common) install snapd || true
   fi
 
-  # Fixes: /etc/X11/Xsession.d/* has_option command not found
   info "Reinstalling x11-common (fixes Xsession has_option issues)..."
   DEBIAN_FRONTEND=noninteractive apt-get $(apt_opts_common) install --reinstall x11-common || true
 
-  # Apply LightDM defaults AFTER the desktop is installed so the session exists
   ensure_lightdm_defaults
 
   mkdir -p "$backup_dir"
