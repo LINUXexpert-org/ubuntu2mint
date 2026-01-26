@@ -1,5 +1,32 @@
 #!/usr/bin/env bash
 # ubuntu-to-mint-convert-v3.sh
+# -----------------------------------------------------------------------------
+# ⚠️  DISCLAIMER (a.k.a. “this is probably a terrible idea”)
+#
+# This script attempts an in-place “Ubuntu → Mint-ish” conversion by mixing
+# repositories and swapping in Mint desktop tooling while keeping Ubuntu as the
+# underlying base. That is, objectively, kind of dumb.
+#
+# It is NOT supported by:
+#   - Linux Mint (they will laugh, politely)
+#   - Ubuntu (they will shrug, then point at “apt policy”)
+#   - Your Corporate IT / Security team (they will revoke your badge)
+#   - Any sane compliance program, MDM, EDR, VPN stack, or audit checklist
+#   - Anyone really. Ever ever ever.
+#
+# Things that may explode spectacularly:
+#   - Display managers / login sessions (hello TTY my old friend)
+#   - Kernel modules, drivers, DKMS builds
+#   - VPN/SSO agents, EDR/MDM enrollment, certificate chains, PAM stacks
+#   - Package resolution (APT will happily “solve” problems by removing half
+#     your system)
+#
+# If you want Linux Mint, the correct solution is:
+#   ✅ BACK UP YOUR DATA → ✅ CLEAN INSTALL MINT → ✅ REINSTALL APPS/AGENTS
+#
+# If you insist on doing this anyway, do it on a VM first, take snapshots, and
+# accept that the most reliable rollback is “restore from backup.”
+# -----------------------------------------------------------------------------
 #
 # Copyright (C) 2026 LINUXexpert.org
 #
