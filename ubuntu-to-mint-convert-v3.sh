@@ -7,7 +7,7 @@
 # under the terms of the GNU General Public License as published by the
 # Free Software Foundation, version 3 of the License.
 #
-# This program is distributed in the hope that it will be useful, but
+# This program is distributed in the hope that you have a useful tool, but
 # WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY
 # or FITNESS FOR A PARTICULAR PURPOSE. See the GNU General Public License
 # for more details.
@@ -21,14 +21,6 @@ set -euo pipefail
 # Version
 # =========================
 SCRIPT_VERSION="5.1"
-# v5.1 changes:
-# - Added deterministic temp-dir cleanup (EXIT trap)
-# - Added dependency + disk-space preflight gates
-# - Improved plan-mode sandbox permissions and _apt sandbox user
-# - Added APT health gate to reduce "first run partial, second run finishes"
-# - Keyring overwrite now backed up before replacement
-# - Added desktop-session validity diagnostics after install
-# - Hardened display-manager.service enablement (systemd alias mechanics)
 
 # =========================
 # Globals / Defaults
@@ -37,9 +29,6 @@ LOG_DIR="/var/log/ubuntu-to-mint"
 mkdir -p "$LOG_DIR"
 LOG_FILE="${LOG_DIR}/ubuntu-to-mint-$(date +%Y%m%d-%H%M%S).log"
 exec > >(tee -a "$LOG_FILE") 2>&1
-
-# Temp tracking (cleanup on exit)
-TEMP_DIRS=()
 
 # CLI defaults
 CMD=""
@@ -59,7 +48,7 @@ OS_VERSION_ID=""
 OS_CODENAME=""
 UBUNTU_BASE=""
 DEFAULT_MINT=""
-ALLOWED_TARGETS=()   # array
+ALLOWED_TARGETS=()
 
 # Key handling
 MINT_KEYID="A6616109451BBBF2"
@@ -67,27 +56,6 @@ SYSTEM_KEYRING="/usr/share/keyrings/linuxmint-repo.gpg"
 
 # Error handling
 ON_ERROR_BACKUP_HINT=""
-
-# =========================
-# Error + cleanup traps
-# =========================
-register_tmpdir() {
-  local d="${1:-}"
-  [[ -n "$d" ]] || return 0
-  TEMP_DIRS+=("$d")
-}
-
-cleanup() {
-  # Never fail cleanup
-  set +e
-  if [[ ${#TEMP_DIRS[@]:-0} -gt 0 ]]; then
-    for d in "${TEMP_DIRS[@]:-}"; do
-      [[ -n "${d:-}" ]] || continue
-      rm -rf "$d" 2>/dev/null || true
-    done
-  fi
-  set -e
-}
 
 on_err() {
   local rc=$?
@@ -97,9 +65,7 @@ on_err() {
   [[ -n "${ON_ERROR_BACKUP_HINT:-}" ]] && echo "${ON_ERROR_BACKUP_HINT}"
   exit "$rc"
 }
-
 trap on_err ERR
-trap cleanup EXIT
 
 # =========================
 # Pretty output
@@ -140,7 +106,7 @@ ubuntu-to-mint-convert-v3.sh (v${SCRIPT_VERSION})
 Usage (command-first):
   sudo bash $0 doctor [options]
   sudo bash $0 plan [options]
-  sudo bash $0 convert --i-accept-the-risk [options]
+  sudo bash $0 convert --i-accept-theISK [options]
   sudo bash $0 rollback /root/ubuntu-to-mint-backup-YYYYMMDD-HHMMSS
 
 Usage (options-first ALSO supported):
@@ -156,78 +122,9 @@ Options:
   --keep-ppas                      Do not disable third-party sources (not recommended)
   --preserve-snap                  Keep snapd (default: enabled)
   --with-recommends                Allow recommended packages (default: off)
-  --yes                            Non-interactive / auto-confirm (also allows non-TTY convert)
+  --yes                            Non-interactive / auto-confirm
   --i-accept-the-risk              Required for convert
 EOF
-}
-
-# =========================
-# Preflight: deps + disk
-# =========================
-check_disk_space_gb() {
-  local min_gb="${1:-2}"
-  local mode="${2:-hard}"  # hard|warn
-  local avail_kb
-  avail_kb="$(df -Pk / 2>/dev/null | awk 'NR==2{print $4}' || echo 0)"
-  [[ "$avail_kb" =~ ^[0-9]+$ ]] || avail_kb=0
-  local avail_gb=$(( avail_kb / 1024 / 1024 ))
-
-  if (( avail_gb < min_gb )); then
-    if [[ "$mode" == "warn" ]]; then
-      warn "Low disk space on /: ~${avail_gb}GB available (recommended >= ${min_gb}GB)."
-      return 0
-    fi
-    die "Insufficient disk space on /: ~${avail_gb}GB available (need >= ${min_gb}GB). Free space and retry."
-  fi
-
-  ok "Disk space OK: ~${avail_gb}GB available (>= ${min_gb}GB)."
-}
-
-check_deps() {
-  # allow_install: yes|no
-  local allow_install="${1:-no}"
-
-  local -a required_cmds=(bash awk sed grep find tee mktemp df apt-get dpkg apt-mark)
-  local -a nice_cmds=(systemctl)
-  local -a missing_cmds=()
-
-  for c in "${required_cmds[@]}"; do
-    have_cmd "$c" || missing_cmds+=("$c")
-  done
-
-  # lock checks rely on fuser (psmisc)
-  have_cmd fuser || missing_cmds+=("fuser")
-
-  if [[ ${#missing_cmds[@]} -gt 0 ]]; then
-    warn "Missing required commands: ${missing_cmds[*]}"
-    if [[ "$allow_install" != "yes" ]]; then
-      die "Missing prerequisites. Install required packages (e.g., curl/gnupg/psmisc) or re-run with --yes to auto-install where safe."
-    fi
-  fi
-
-  # Attempt safe installs when allowed
-  if [[ "$allow_install" == "yes" ]]; then
-    local -a pkgs=()
-    have_cmd curl || pkgs+=(curl)
-    have_cmd gpg || pkgs+=(gnupg)
-    [[ -r /etc/ssl/certs/ca-certificates.crt ]] || pkgs+=(ca-certificates)
-    have_cmd dpkg-deb || pkgs+=(dpkg-dev)
-    have_cmd fuser || pkgs+=(psmisc)
-    # Helps signed-by for Ubuntu repos
-    [[ -r /usr/share/keyrings/ubuntu-archive-keyring.gpg ]] || pkgs+=(ubuntu-keyring)
-
-    if [[ ${#pkgs[@]} -gt 0 ]]; then
-      info "Installing missing prerequisites (best-effort): ${pkgs[*]}"
-      DEBIAN_FRONTEND=noninteractive apt-get update -y >/dev/null 2>&1 || true
-      DEBIAN_FRONTEND=noninteractive apt-get install -y "${pkgs[@]}" >/dev/null 2>&1 || true
-    fi
-  fi
-
-  for c in "${nice_cmds[@]}"; do
-    have_cmd "$c" || warn "Optional command not found: $c (some checks/automation may be limited)."
-  done
-
-  ok "Dependency preflight complete."
 }
 
 # =========================
@@ -236,7 +133,7 @@ check_deps() {
 ensure_no_apt_locks() {
   local locks=(/var/lib/dpkg/lock-frontend /var/lib/dpkg/lock /var/lib/apt/lists/lock /var/cache/apt/archives/lock)
   for l in "${locks[@]}"; do
-    if [[ -e "$l" ]] && fuser "$l" >/dev/null 2>&1; then
+    if fuser "$l" >/dev/null 2>&1; then
       die "APT/dpkg lock is held (lock file: $l). Close package managers and try again."
     fi
   done
@@ -246,37 +143,6 @@ apt_fix_broken() {
   info "Attempting basic dpkg/apt remediation (best-effort)..."
   DEBIAN_FRONTEND=noninteractive dpkg --configure -a || true
   DEBIAN_FRONTEND=noninteractive apt-get -y -f install || true
-}
-
-apt_health_gate() {
-  # Aim: reduce "partial first run" by refusing to proceed when dpkg/apt is clearly unhappy.
-  info "APT health gate (preflight)..."
-  local audit_out=""
-  audit_out="$(dpkg --audit 2>/dev/null || true)"
-  if [[ -n "$audit_out" ]]; then
-    warn "dpkg --audit reported issues (attempting to repair):"
-    echo "$audit_out"
-  fi
-
-  apt_fix_broken
-
-  # Basic repo sanity without touching sources yet.
-  set +e
-  DEBIAN_FRONTEND=noninteractive apt-get -o Dpkg::Use-Pty=0 -o Acquire::Retries=2 update >/dev/null 2>&1
-  local rc=$?
-  set -e
-  if [[ $rc -ne 0 ]]; then
-    warn "apt-get update had issues before conversion. This may be corporate proxy/mirror-related."
-    warn "Proceeding, but conversion success probability is reduced."
-  fi
-
-  # If dpkg is still in a bad state, stop.
-  audit_out="$(dpkg --audit 2>/dev/null || true)"
-  if [[ -n "$audit_out" ]]; then
-    die "dpkg is still in an unhealthy state after repair attempts. Resolve dpkg/apt issues before converting."
-  fi
-
-  ok "APT health gate passed."
 }
 
 apt_opts_common() {
@@ -306,7 +172,7 @@ detect_os() {
 
   [[ "$OS_ID" == "ubuntu" ]] || die "Unsupported OS ID '${OS_ID}'. This script supports Ubuntu bases only."
 
-  case "${OS_CODENAME}" in
+  case "$OS_CODENAME" in
     noble)
       UBUNTU_BASE="noble"
       DEFAULT_MINT="zena"
@@ -333,10 +199,6 @@ detect_os() {
     cinnamon|mate|xfce) : ;;
     *) die "Unsupported --edition '${EDITION}'. Allowed: cinnamon|mate|xfce" ;;
   esac
-
-  # Normalize potential whitespace / CRLF
-  TARGET_MINT="$(echo -n "$TARGET_MINT" | tr -d '\r' | xargs)"
-  EDITION="$(echo -n "$EDITION" | tr -d '\r' | xargs)"
 
   local found="no"
   for t in "${ALLOWED_TARGETS[@]}"; do
@@ -367,7 +229,7 @@ backup_system_state() {
   dpkg-query -W -f='${Package}\t${Version}\n' > "${backup_dir}/dpkg-packages.tsv" || true
   apt-mark showmanual > "${backup_dir}/apt-manual.txt" || true
   apt-mark showhold > "${backup_dir}/apt-holds.txt" || true
-  systemctl list-unit-files --state=enabled > "${backup_dir}/enabled-services.txt" 2>/dev/null || true
+  systemctl list-unit-files --state=enabled > "${backup_dir}/enabled-services.txt" || true
 
   if have_cmd snap; then snap list > "${backup_dir}/snap-list.txt" || true; fi
   if have_cmd flatpak; then flatpak list > "${backup_dir}/flatpak-list.txt" || true; fi
@@ -417,9 +279,7 @@ timeshift_snapshot_best_effort() {
 gpg_key_file_has_keyid() {
   local f="$1"
   local keyid="$2"
-  gpg --batch --with-colons --show-keys "$f" 2>/dev/null \
-    | awk -F: '$1=="pub"||$1=="sub"{print toupper($5)}' \
-    | grep -qx "$(echo "$keyid" | tr '[:lower:]' '[:upper:]')"
+  gpg --batch --with-colons --show-keys "$f" 2>/dev/null | awk -F: '$1=="pub"||$1=="sub"{print toupper($5)}' | grep -qx "$(echo "$keyid" | tr '[:lower:]' '[:upper:]')"
 }
 
 ubuntu_archive_keyring_path() {
@@ -440,7 +300,6 @@ mint_keyring_build_from_linuxmint_keyring_deb() {
 
   local tmpdir
   tmpdir="$(mktemp -d)"
-  register_tmpdir "$tmpdir"
   chmod 700 "$tmpdir"
 
   local pool_https="https://packages.linuxmint.com/pool/main/l/linuxmint-keyring/"
@@ -453,12 +312,13 @@ mint_keyring_build_from_linuxmint_keyring_deb() {
   elif index="$(curl -fsSL "$pool_http" 2>/dev/null)"; then
     :
   else
+    rm -rf "$tmpdir"
     die "Unable to fetch linuxmint-keyring pool index (blocked network/proxy?)"
   fi
 
   local debs
   debs="$(printf '%s' "$index" | grep -oE 'linuxmint-keyring_[0-9][^"]*_all\.deb' | sort -Vu | uniq || true)"
-  [[ -n "$debs" ]] || die "Could not find linuxmint-keyring_*.deb in pool index."
+  [[ -n "$debs" ]] || { rm -rf "$tmpdir"; die "Could not find linuxmint-keyring_*.deb in pool index." ; }
 
   local deb
   deb="$(printf '%s\n' "$debs" | tail -n 1)"
@@ -471,16 +331,15 @@ mint_keyring_build_from_linuxmint_keyring_deb() {
     deb_url="${pool_http}${deb}"
   fi
 
-  curl -fSL "$deb_url" -o "${tmpdir}/${deb}" || die "Failed to download ${deb_url}"
+  curl -fSL "$deb_url" -o "${tmpdir}/${deb}" || { rm -rf "$tmpdir"; die "Failed to download ${deb_url}"; }
 
   mkdir -p "${tmpdir}/extract"
   dpkg-deb -x "${tmpdir}/${deb}" "${tmpdir}/extract"
 
   local -a candidates=()
-  while IFS= read -r f; do candidates+=("$f"); done < <(
-    find "${tmpdir}/extract" -type f \( -name '*.gpg' -o -name '*.asc' -o -name '*.key' \) 2>/dev/null | sort
-  )
-  [[ ${#candidates[@]} -gt 0 ]] || die "No key candidates found inside linuxmint-keyring deb."
+  while IFS= read -r f; do candidates+=("$f"); done < <(find "${tmpdir}/extract" -type f \( -name '*.gpg' -o -name '*.asc' -o -name '*.key' \) 2>/dev/null | sort)
+
+  [[ ${#candidates[@]} -gt 0 ]] || { rm -rf "$tmpdir"; die "No key candidates found inside linuxmint-keyring deb." ; }
 
   local chosen=""
   for f in "${candidates[@]}"; do
@@ -489,7 +348,13 @@ mint_keyring_build_from_linuxmint_keyring_deb() {
       break
     fi
   done
-  [[ -n "$chosen" ]] || die "None of the candidate key files contained keyid ${MINT_KEYID}."
+
+  [[ -n "$chosen" ]] || {
+    warn "Candidates found:"
+    printf '  - %s\n' "${candidates[@]}" || true
+    rm -rf "$tmpdir"
+    die "None of the candidate key files contained keyid ${MINT_KEYID}."
+  }
 
   mkdir -p "$(dirname "$out_keyring")"
 
@@ -499,18 +364,19 @@ mint_keyring_build_from_linuxmint_keyring_deb() {
 
   info "Using key candidate: $chosen"
   if [[ "$chosen" == *.asc || "$chosen" == *.key ]]; then
-    grep -q "BEGIN PGP PUBLIC KEY BLOCK" "$chosen" 2>/dev/null || die "Selected key candidate is not armored PGP: $chosen"
+    grep -q "BEGIN PGP PUBLIC KEY BLOCK" "$chosen" 2>/dev/null || { rm -rf "$tmpdir"; die "Selected key candidate is not armored PGP: $chosen"; }
     gpg --batch --dearmor -o "$tmp_out" "$chosen"
   else
     cp -a "$chosen" "$tmp_out"
   fi
 
-  gpg_key_file_has_keyid "$tmp_out" "$MINT_KEYID" || die "Built keyring does not contain ${MINT_KEYID}"
+  gpg_key_file_has_keyid "$tmp_out" "$MINT_KEYID" || { rm -rf "$tmpdir"; die "Built keyring does not contain ${MINT_KEYID}"; }
 
   rm -f "$out_keyring"
   install -m 0644 "$tmp_out" "$out_keyring"
 
   ok "Mint repo keyring written: $out_keyring (contains ${MINT_KEYID})"
+  rm -rf "$tmpdir"
 }
 
 mint_repo_key_install_system() {
@@ -524,9 +390,7 @@ mint_repo_key_install_system() {
     fi
 
     if [[ "$ASSUME_YES" == "yes" ]]; then
-      local bkp="/root/ubuntu2mint-linuxmint-repo-keyring-backup-$(date +%Y%m%d-%H%M%S).gpg"
-      warn "Existing keyring does not contain expected key; backing up to ${bkp} then overwriting due to --yes."
-      cp -a "$keyring" "$bkp" 2>/dev/null || true
+      warn "Existing keyring does not contain expected key; overwriting due to --yes."
       rm -f "$keyring"
     else
       warn "Existing keyring at ${keyring} does not contain expected key ${MINT_KEYID}."
@@ -658,12 +522,35 @@ verify_session_desktop_exists() {
 }
 
 force_display_manager_symlink() {
-  # Enforce /etc/systemd/system/display-manager.service -> lightdm.service when possible.
+  # Some systems end up with display-manager.service still pointing to gdm3 (or missing).
+  # LightDM's unit typically provides Alias=display-manager.service, but we enforce if needed.
   if [[ -d /run/systemd/system ]]; then
     if [[ -f /lib/systemd/system/lightdm.service ]]; then
       mkdir -p /etc/systemd/system
       ln -sf /lib/systemd/system/lightdm.service /etc/systemd/system/display-manager.service || true
+    elif [[ -f /usr/lib/systemd/system/lightdm.service ]]; then
+      mkdir -p /etc/systemd/system
+      ln -sf /usr/lib/systemd/system/lightdm.service /etc/systemd/system/display-manager.service || true
     fi
+  fi
+}
+
+preseed_lightdm_default_display_manager() {
+  # In DEBIAN_FRONTEND=noninteractive, installing lightdm alongside an existing DM
+  # defaults to keeping the current DM (often gdm3). We must preseed debconf so
+  # dpkg is instructed to pick LightDM authoritatively.
+  info "Pre-seeding default display manager to LightDM (debconf)..."
+  if ! have_cmd debconf-set-selections; then
+    info "Installing debconf-utils (for debconf-set-selections)..."
+    DEBIAN_FRONTEND=noninteractive apt-get $(apt_opts_common) install debconf-utils >/dev/null 2>&1 || true
+  fi
+  if have_cmd debconf-set-selections; then
+    printf "lightdm shared/default-x-display-manager select lightdm\n" | debconf-set-selections || true
+    printf "gdm3 shared/default-x-display-manager select lightdm\n" | debconf-set-selections || true
+    printf "sddm shared/default-x-display-manager select lightdm\n" | debconf-set-selections || true
+    ok "Debconf preseed staged: shared/default-x-display-manager=lightdm"
+  else
+    warn "debconf-set-selections unavailable; will rely on manual enforcement."
   fi
 }
 
@@ -673,50 +560,65 @@ ensure_lightdm_on_boot() {
     return 0
   fi
 
-  info "Ensuring LightDM starts on boot (graphical.target + display-manager.service)..."
+  info "Ensuring LightDM starts on boot (authoritative default selection + systemd enable)..."
 
-  DEBIAN_FRONTEND=noninteractive apt-get install -y lightdm slick-greeter >/dev/null 2>&1 || true
+  # 0) Ensure debconf is seeded BEFORE any install/reconfigure paths
+  preseed_lightdm_default_display_manager
 
-  # Unmask anything that could block startup
-  systemctl unmask lightdm.service >/dev/null 2>&1 || true
-  systemctl unmask display-manager.service >/dev/null 2>&1 || true
+  # 1) Ensure packages exist (noninteractive safe)
+  DEBIAN_FRONTEND=noninteractive apt-get $(apt_opts_common) install lightdm slick-greeter >/dev/null 2>&1 || true
 
-  # Boot to graphical target
+  # 2) Force dpkg to apply the default-display-manager choice using maintainer scripts
+  # (updates /etc/X11/default-display-manager and update-alternatives; often the systemd alias too)
+  if ! have_cmd dpkg-reconfigure; then
+    DEBIAN_FRONTEND=noninteractive apt-get $(apt_opts_common) install debconf >/dev/null 2>&1 || true
+  fi
+
+  if have_cmd dpkg-reconfigure && dpkg -s lightdm >/dev/null 2>&1; then
+    info "Running dpkg-reconfigure (noninteractive) for lightdm..."
+    DEBIAN_FRONTEND=noninteractive dpkg-reconfigure -f noninteractive lightdm >/dev/null 2>&1 || warn "dpkg-reconfigure lightdm failed; continuing with manual enforcement."
+  else
+    warn "dpkg-reconfigure not available or lightdm not installed; skipping reconfigure."
+  fi
+
+  # 3) Standard systemd setup
+  systemctl unmask lightdm >/dev/null 2>&1 || true
+  systemctl unmask display-manager >/dev/null 2>&1 || true
+
   systemctl set-default graphical.target >/dev/null 2>&1 || true
   systemctl enable graphical.target >/dev/null 2>&1 || true
 
-  # Default display manager selection (Debian/Ubuntu mechanism)
+  # 4) Safety net: explicitly set canonical knobs even if dpkg scripts didn't
   echo "/usr/sbin/lightdm" > /etc/X11/default-display-manager || true
   if have_cmd update-alternatives; then
     update-alternatives --set x-display-manager /usr/sbin/lightdm >/dev/null 2>&1 || true
   fi
 
-  # If GDM exists, disable it so it can't steal the login screen
-  if systemctl list-unit-files 2>/dev/null | awk '{print $1}' | grep -qx 'gdm3.service'; then
-    systemctl disable --now gdm3.service >/dev/null 2>&1 || true
-    systemctl mask gdm3.service >/dev/null 2>&1 || true
-  fi
-
-  # Ensure the display-manager alias points to lightdm
+  # 5) Ensure display-manager alias points to LightDM (covers "missing display-manager.service" cases)
   force_display_manager_symlink
 
   systemctl daemon-reload >/dev/null 2>&1 || true
 
-  # Enable display-manager.service (the alias most systems rely on)
-  systemctl enable display-manager.service >/dev/null 2>&1 || true
+  # Disable competing DM so it can't steal the greeter on boot
+  if systemctl list-unit-files 2>/dev/null | awk '{print $1}' | grep -qx 'gdm3.service'; then
+    systemctl disable --now gdm3 >/dev/null 2>&1 || true
+    systemctl mask gdm3 >/dev/null 2>&1 || true
+  fi
 
-  # lightdm.service may be "static" on some Ubuntu builds; enabling may be a no-op (fine)
+  # Enable LightDM
   systemctl enable lightdm.service >/dev/null 2>&1 || true
+  systemctl enable lightdm >/dev/null 2>&1 || true
 
-  # Try to (re)enable links if previously swapped
-  systemctl reenable display-manager.service >/dev/null 2>&1 || true
-  systemctl reenable lightdm.service >/dev/null 2>&1 || true
+  # If display-manager exists now, enable it too
+  systemctl enable display-manager >/dev/null 2>&1 || true
+
+  # Recreate enablement links (helps when units were swapped previously)
+  systemctl reenable lightdm >/dev/null 2>&1 || true
 
   # Start now (best-effort)
-  systemctl restart display-manager.service >/dev/null 2>&1 || true
-  systemctl restart lightdm.service >/dev/null 2>&1 || true
+  systemctl restart lightdm >/dev/null 2>&1 || true
 
-  ok "LightDM configured to start on boot."
+  ok "LightDM configured to start on boot (debconf + dpkg-reconfigure + safety net)."
 }
 
 ensure_lightdm_defaults() {
@@ -724,7 +626,11 @@ ensure_lightdm_defaults() {
   sess="$(session_name_for_edition)"
 
   info "Configuring LightDM defaults for edition=${EDITION} (session=${sess})"
-  DEBIAN_FRONTEND=noninteractive apt-get install -y lightdm slick-greeter
+
+  # Preseed DM choice BEFORE any install that might prompt (even in noninteractive)
+  preseed_lightdm_default_display_manager
+
+  DEBIAN_FRONTEND=noninteractive apt-get $(apt_opts_common) install lightdm slick-greeter >/dev/null 2>&1 || true
 
   mkdir -p /etc/lightdm/lightdm.conf.d
 
@@ -778,6 +684,7 @@ EOF
   done
 
   verify_session_desktop_exists "$sess" || true
+
   ensure_lightdm_on_boot
   ok "LightDM defaults applied; default session set to ${sess}."
 }
@@ -802,7 +709,6 @@ apply_mintupdate_icon_diversion() {
 # =========================
 post_install_sanity() {
   local out_file="${1:-/tmp/post-convert-validation.txt}"
-  mkdir -p "$(dirname "$out_file")" 2>/dev/null || true
 
   {
     echo "Post-conversion validation ($(date -Is))"
@@ -821,9 +727,9 @@ post_install_sanity() {
     echo "Boot/display settings:"
     echo "default-display-manager: $(cat /etc/X11/default-display-manager 2>/dev/null || echo MISSING)"
     echo "default target: $(systemctl get-default 2>/dev/null || echo unknown)"
-    echo "lightdm enabled: $(systemctl is-enabled lightdm.service 2>/dev/null || echo unknown)"
-    echo "display-manager enabled: $(systemctl is-enabled display-manager.service 2>/dev/null || echo unknown)"
-    echo "gdm3 enabled: $(systemctl is-enabled gdm3.service 2>/dev/null || echo not-installed)"
+    echo "lightdm enabled: $(systemctl is-enabled lightdm 2>/dev/null || echo unknown)"
+    echo "display-manager enabled: $(systemctl is-enabled display-manager 2>/dev/null || echo unknown)"
+    echo "gdm3 enabled: $(systemctl is-enabled gdm3 2>/dev/null || echo not-installed)"
     echo
     echo "display-manager.service link:"
     ls -l /etc/systemd/system/display-manager.service 2>/dev/null || true
@@ -833,40 +739,15 @@ post_install_sanity() {
   ok "Post-conversion validation written: $out_file"
 }
 
-validate_desktop_session_runtime() {
-  local sess
-  sess="$(session_name_for_edition)"
-
-  info "Desktop session diagnostics (non-fatal)..."
-  verify_session_desktop_exists "$sess" || true
-
-  case "$EDITION" in
-    cinnamon)
-      have_cmd cinnamon-session || warn "Missing command: cinnamon-session (Cinnamon logins may fail)."
-      have_cmd muffin || warn "Missing command: muffin (Cinnamon compositor)."
-      if [[ -x /usr/bin/csd-power ]]; then
-        if /usr/bin/csd-power --help >/dev/null 2>&1; then
-          ok "csd-power runs (basic)."
-        else
-          warn "csd-power appears broken (may cause Cinnamon login loop). Consider reinstalling cinnamon-settings-daemon."
-        fi
-      fi
-      ;;
-    xfce)
-      have_cmd xfce4-session || warn "Missing command: xfce4-session."
-      ;;
-    mate)
-      have_cmd mate-session || warn "Missing command: mate-session."
-      ;;
-  esac
-}
-
 # =========================
-# Install stack with retry (reduces "first run partial, second run completes")
+# Install stack with retry (fixes "first run partial, second run completes")
 # =========================
 install_mint_stack_with_retry() {
   local meta="$1"
   shift || true
+
+  # Ensure DM choice is preseeded BEFORE meta install (lightdm often pulled as dependency)
+  preseed_lightdm_default_display_manager
 
   local -a pkgs=(
     "$meta"
@@ -906,56 +787,43 @@ install_mint_stack_with_retry() {
 # =========================
 apt_tmp_run() {
   local tmpapt="$1"; shift
-  local -a extra=(
-    -o "Dir=${tmpapt}"
-    -o "Dir::State::status=/var/lib/dpkg/status"
-    -o "Dir::Etc::sourcelist=${tmpapt}/etc/apt/sources.list"
-    -o "Dir::Etc::sourceparts=${tmpapt}/etc/apt/sources.list.d"
-    -o "Dir::Etc::preferencesparts=${tmpapt}/etc/apt/preferences.d"
-    -o "Dir::Cache=${tmpapt}/var/cache/apt"
-    -o "Dir::State=${tmpapt}/var/lib/apt"
-    -o "Dir::State::Lists=${tmpapt}/var/lib/apt/lists"
-    -o "APT::Sandbox::User=_apt"
-  )
+  local -a extra=(-o "Dir=${tmpapt}"
+                  -o "Dir::State::status=/var/lib/dpkg/status"
+                  -o "Dir::Etc::sourcelist=${tmpapt}/etc/apt/sources.list"
+                  -o "Dir::Etc::sourceparts=${tmpapt}/etc/apt/sources.list.d"
+                  -o "Dir::Etc::preferencesparts=${tmpapt}/etc/apt/preferences.d"
+                  -o "Dir::Cache=${tmpapt}/var/cache/apt"
+                  -o "Dir::State=${tmpapt}/var/lib/apt"
+                  -o "Dir::State::Lists=${tmpapt}/var/lib/apt/lists")
   apt-get "${extra[@]}" "$@"
 }
 
 plan_fix_tmpapt_perms() {
   local tmpapt="$1"
 
-  chmod 755 "$tmpapt" 2>/dev/null || true
+  chmod 755 "$tmpapt" || true
   chmod 755 "$tmpapt"/{etc,usr,var} 2>/dev/null || true
   chmod 755 "$tmpapt"/var/{lib,cache} 2>/dev/null || true
   chmod 755 "$tmpapt"/var/lib/apt 2>/dev/null || true
   chmod 755 "$tmpapt"/var/cache/apt 2>/dev/null || true
 
   if id _apt >/dev/null 2>&1; then
-    if [[ -d "$tmpapt/var/lib/apt/lists/partial" ]]; then
-      chown -R _apt:root "$tmpapt/var/lib/apt/lists/partial" 2>/dev/null || true
-      chmod 755 "$tmpapt/var/lib/apt/lists/partial" 2>/dev/null || true
-    fi
-    if [[ -d "$tmpapt/var/cache/apt/archives/partial" ]]; then
-      chown -R _apt:root "$tmpapt/var/cache/apt/archives/partial" 2>/dev/null || true
-      chmod 755 "$tmpapt/var/cache/apt/archives/partial" 2>/dev/null || true
-    fi
-    # Ensure lists/archives roots are readable by _apt
-    chown -R _apt:root "$tmpapt/var/lib/apt/lists" "$tmpapt/var/cache/apt/archives" 2>/dev/null || true
+    chown -R _apt:root "$tmpapt/var/lib/apt/lists/partial" 2>/dev/null || true
+    chown -R _apt:root "$tmpapt/var/cache/apt/archives/partial" 2>/dev/null || true
+    chmod 755 "$tmpapt/var/lib/apt/lists/partial" 2>/dev/null || true
+    chmod 755 "$tmpapt/var/cache/apt/archives/partial" 2>/dev/null || true
   fi
 }
 
 plan_mode() {
   need_root
-  check_deps "yes"
   ensure_no_apt_locks
   detect_os
-  check_disk_space_gb 2 hard
 
   info "Running plan mode (dry-run) with temporary APT root..."
 
   local tmpapt
   tmpapt="$(mktemp -d)"
-  register_tmpdir "$tmpapt"
-
   mkdir -p "${tmpapt}/etc/apt/sources.list.d" \
            "${tmpapt}/etc/apt/preferences.d" \
            "${tmpapt}/var/lib/apt/lists/partial" \
@@ -1015,6 +883,8 @@ EOF
   local rc=${PIPESTATUS[0]}
   set -e
 
+  rm -rf "$tmpapt"
+
   if [[ $rc -ne 0 ]]; then
     warn "Plan simulation failed (exit $rc). Review: $plan_out"
     exit $rc
@@ -1028,10 +898,8 @@ EOF
 # =========================
 doctor() {
   need_root
-  check_deps "${ASSUME_YES}"
   ensure_no_apt_locks
   detect_os
-  check_disk_space_gb 2 warn
 
   info "Doctor checks..."
   apt_fix_broken
@@ -1082,21 +950,17 @@ show_disclaimer_and_require_ack() {
 
 convert() {
   need_root
-  check_deps "yes"
   ensure_no_apt_locks
   detect_os
-  check_disk_space_gb 6 hard
   show_disclaimer_and_require_ack
 
-  # Make first run succeed more often:
-  apt_health_gate
+  apt_fix_broken
 
   local backup_dir
   backup_dir="$(backup_system_state)"
   disable_thirdparty_sources_system "$backup_dir"
   timeshift_snapshot_best_effort
 
-  # Deterministic repo verification:
   mint_repo_key_install_system
   write_mint_sources_system
   write_mint_pinning_system
@@ -1118,16 +982,12 @@ convert() {
     DEBIAN_FRONTEND=noninteractive apt-get $(apt_opts_common) install snapd || true
   fi
 
-  # Fix: /etc/X11/Xsession.d/* has_option command not found
   info "Reinstalling x11-common (fixes Xsession has_option issues)..."
   DEBIAN_FRONTEND=noninteractive apt-get $(apt_opts_common) install --reinstall x11-common || true
 
-  # Apply LightDM defaults AFTER the desktop is installed
   ensure_lightdm_defaults
 
-  validate_desktop_session_runtime || true
-
-  mkdir -p "$backup_dir" 2>/dev/null || true
+  mkdir -p "$backup_dir"
   post_install_sanity "${backup_dir}/post-convert-validation.txt" || true
 
   ok "Conversion steps completed."
