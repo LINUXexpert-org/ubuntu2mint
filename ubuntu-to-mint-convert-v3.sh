@@ -24,7 +24,7 @@ IFS=$'\n\t'
 ###############################################################################
 
 SCRIPT_NAME="$(basename "$0")"
-SCRIPT_VERSION="4.5"
+SCRIPT_VERSION="4.6"
 
 LOG_DIR="/var/log/ubuntu-to-mint"
 DEFAULT_MINT_MIRROR="http://packages.linuxmint.com"
@@ -140,7 +140,7 @@ Options:
   --keep-ppas                      Do NOT disable third-party APT sources (not recommended)
   --preserve-snap / --no-preserve-snap   (default: preserve snap)
   --with-recommends                Allow recommended packages during install (default: off)
-  --yes                            Skip most prompts (convert still requires disclaimer gate + --i-accept-the-risk)
+  --yes                            Skip most prompts; in non-interactive shells this is REQUIRED for convert disclaimer
   --max-removals N                 Abort if APT simulation removes more than N packages (default: ${MAX_ALLOWED_REMOVALS_DEFAULT})
 
   --overwrite-keyring              If ${KEYRING_OUT} exists, overwrite it
@@ -288,9 +288,15 @@ convert_disclaimer_gate() {
     die "convert requires --i-accept-the-risk"
   fi
 
-  # Required interaction even with --yes (user explicitly requested this)
+  # If no TTY (CI/non-interactive shell), allow only if --yes is also set.
   if ! is_tty; then
-    die "convert requires an interactive TTY to acknowledge the disclaimer."
+    if [[ "$ASSUME_YES" == "yes" ]]; then
+      warn "No interactive TTY detected; proceeding non-interactively because --yes + --i-accept-the-risk were provided."
+      warn "This is UNSUPPORTED and may break corporate agents/EDR/MDM/VPN/compliance tooling."
+      ok "Non-interactive disclaimer acknowledged via flags."
+      return 0
+    fi
+    die "No interactive TTY detected. Re-run with --yes to acknowledge the disclaimer non-interactively."
   fi
 
   echo
@@ -379,7 +385,6 @@ backup_system_state() {
   if have_cmd snap; then snap list > "${backup_dir}/snap-list.txt" || true; fi
   if have_cmd flatpak; then flatpak list > "${backup_dir}/flatpak-list.txt" || true; fi
 
-  # Always create the post-validation report placeholder so callers never fail on missing file
   : > "${backup_dir}/post-convert-validation.txt" || true
 
   ok "Backup complete."
@@ -420,8 +425,6 @@ file_contains_any() {
 
 is_allowlisted_thirdparty_source() {
   local file="$1"
-  # Keep common enterprise repos & key services that often underpin corporate agents.
-  # This is intentionally conservative to avoid breaking GlobalProtect/CrowdStrike/etc.
   file_contains_any "$file" \
     "crowdstrike" "falcon" \
     "paloaltonetworks" "globalprotect" \
@@ -453,7 +456,6 @@ disable_thirdparty_sources_system() {
       continue
     fi
 
-    # Allowlist heuristic: keep some corp repos
     if is_allowlisted_thirdparty_source "$f"; then
       warn "Keeping allowlisted third-party source: $f"
       continue
@@ -479,18 +481,15 @@ fetch_linuxmint_keyring_deb() {
     die "Unable to fetch linuxmint-keyring directory index from ${base}"
   fi
 
-  # Extract candidates; pick newest by version sort
   local candidates
   candidates="$(grep -oE 'linuxmint-keyring_[0-9][0-9][0-9][0-9][^"]*_all\.deb' "$index_html" | sort -u || true)"
   rm -f "$index_html"
 
   local chosen=""
   if [[ -n "$candidates" ]]; then
-    # sort -V to pick latest-looking version string
     chosen="$(printf '%s\n' $candidates | sort -V | tail -n 1)"
   fi
 
-  # Fallback known good version if parsing fails
   if [[ -z "$chosen" ]]; then
     chosen="linuxmint-keyring_2022.06.21_all.deb"
     warn "Could not parse latest linuxmint-keyring from index; falling back to ${chosen}"
@@ -530,7 +529,6 @@ install_mint_repo_keyring() {
   local deb="${tmpdir}/linuxmint-keyring.deb"
   fetch_linuxmint_keyring_deb "$deb"
 
-  # Extract package, find key file(s)
   dpkg-deb -x "$deb" "$tmpdir/extract"
 
   local found_gpg=""
@@ -543,8 +541,6 @@ install_mint_repo_keyring() {
   if [[ "$found_gpg" == *.gpg ]]; then
     cp -a "$found_gpg" "$keyring"
   else
-    # Convert .asc to binary .gpg keyring
-    # Ensure output doesn't exist to avoid "dearmoring failed: File exists"
     rm -f "$keyring" || true
     gpg --batch --dearmor -o "$keyring" "$found_gpg"
   fi
@@ -561,14 +557,12 @@ UBUNTU_ARCHIVE_MIRROR="http://archive.ubuntu.com/ubuntu"
 UBUNTU_SECURITY_MIRROR="http://security.ubuntu.com/ubuntu"
 
 detect_ubuntu_mirrors() {
-  # If system uses a custom mirror in sources, reuse it. Otherwise defaults above.
   local first=""
   first="$(grep -RhoE '^deb[[:space:]]+https?://[^[:space:]]+/ubuntu' /etc/apt/sources.list /etc/apt/sources.list.d/*.list 2>/dev/null | head -n 1 || true)"
   if [[ -n "$first" ]]; then
     local url
     url="$(echo "$first" | awk '{print $2}' | sed 's#/ubuntu$##')"
     UBUNTU_ARCHIVE_MIRROR="${url%/}/ubuntu"
-    # security mirror stays default unless explicitly detected
   fi
   info "Ubuntu archive mirror:  ${UBUNTU_ARCHIVE_MIRROR}"
   info "Ubuntu security mirror: ${UBUNTU_SECURITY_MIRROR}"
@@ -598,7 +592,6 @@ deb ${UBUNTU_ARCHIVE_MIRROR%/} ${UBUNTU_BASE}-backports main restricted universe
 deb ${UBUNTU_SECURITY_MIRROR%/} ${UBUNTU_BASE}-security main restricted universe multiverse
 EOF
 
-  # Comment out legacy /etc/apt/sources.list entries to reduce duplication
   if [[ -f /etc/apt/sources.list ]]; then
     sed -i 's/^[[:space:]]*deb /# deb /' /etc/apt/sources.list || true
   fi
@@ -609,21 +602,17 @@ EOF
 write_mint_pinning_system() {
   info "Writing APT pinning..."
 
-  # Base pin: Mint origin low by default (Ubuntu remains base for overlaps)
   cat > "$PIN_BASE_OUT" <<'EOF'
 Package: *
 Pin: origin "packages.linuxmint.com"
 Pin-Priority: 100
 
-# Prefer Ubuntu as the general default (keep base stable)
 Package: *
 Pin: release o=Ubuntu
 Pin-Priority: 500
 EOF
 
-  # Desktop stack pin: force Mint for the desktop stack to avoid mixed-version crashes
   cat > "$PIN_STACK_OUT" <<'EOF'
-# Strongly prefer Mint for desktop stack packages to avoid ABI/API mismatches
 Package: mint* mintsources* mintupdate* mintsystem* mintstick* mintmenu* mintlocale* mintdrivers* mintreport* mintwelcome*
 Pin: origin "packages.linuxmint.com"
 Pin-Priority: 1001
@@ -633,7 +622,6 @@ Pin: origin "packages.linuxmint.com"
 Pin-Priority: 1001
 EOF
 
-  # Preserve snap (prevent accidental removal)
   cat > "$SNAP_PREF_OUT" <<EOF
 Package: snapd*
 Pin: release o=Ubuntu
@@ -671,18 +659,11 @@ apt_simulate_install() {
 
   export DEBIAN_FRONTEND=noninteractive
   local apt_opts=(); apt_get_opts_common apt_opts
-
-  # Print the simulation output to both stdout and file.
-  # (The command caller may tee it as well; this is fine.)
   apt-get -s "${apt_opts[@]}" install "${pkgs[@]}" | tee "$sim_out" >/dev/null
 }
 
 apt_sim_parse_removals() {
   local sim_out="$1"
-
-  # apt-get -s output shows lines like:
-  #   Remv package [version]
-  #   Remv package:amd64 [version]
   local removed_count
   removed_count="$(grep -E '^Remv[[:space:]]' "$sim_out" | wc -l | tr -d ' ')"
   echo "${removed_count:-0}"
@@ -727,8 +708,6 @@ apt_sim_abort_if_unsafe() {
 purge_conflicting_flavors_best_effort() {
   [[ "$PURGE_CONFLICTING_FLAVORS" == "yes" ]] || return 0
 
-  # Ubuntu Cinnamon flavor packages can conflict with Mint cinnamon stack.
-  # We remove them if installed.
   local conflicts=(
     "ubuntucinnamon-desktop"
     "ubuntucinnamon-environment"
@@ -751,15 +730,12 @@ purge_conflicting_flavors_best_effort() {
   warn "Purging potentially conflicting Ubuntu flavor packages (best-effort)..."
   export DEBIAN_FRONTEND=noninteractive
   local apt_opts=(); apt_get_opts_common apt_opts
-  # Use purge with globs; if nothing matches, apt ignores.
   apt-get "${apt_opts[@]}" purge ubuntucinnamon-desktop ubuntucinnamon-\* cinnamon-desktop-environment || true
   apt-get "${apt_opts[@]}" autoremove || true
   ok "Conflict purge attempt complete."
 }
 
 remove_software_properties_gtk_best_effort() {
-  # Known conflict: mintupdate may try to overwrite an icon owned by software-properties-gtk on Ubuntu.
-  # Safer approach: remove the Ubuntu GUI tool (does not remove add-apt-repository / software-properties-common).
   if dpkg -s software-properties-gtk >/dev/null 2>&1; then
     warn "Removing software-properties-gtk to avoid dpkg file overwrite conflicts with Mint tooling (best-effort)..."
     export DEBIAN_FRONTEND=noninteractive
@@ -782,7 +758,6 @@ session_name_for_edition() {
 }
 
 ensure_x11_common_present() {
-  # Fixes cases where /etc/X11/Xsession lacks helpers (e.g., has_option) due to missing x11-common.
   export DEBIAN_FRONTEND=noninteractive
   local apt_opts=(); apt_get_opts_common apt_opts
   apt-get "${apt_opts[@]}" install --reinstall x11-common || true
@@ -808,7 +783,6 @@ greeter-session=slick-greeter
 user-session=${sess}
 EOF
 
-  # Set default display manager non-interactively
   if have_cmd debconf-set-selections; then
     echo "lightdm shared/default-x-display-manager select lightdm" | debconf-set-selections || true
   fi
@@ -816,7 +790,6 @@ EOF
     dpkg-reconfigure -f noninteractive lightdm || true
   fi
 
-  # Disable gdm3 if installed/enabled (common on Ubuntu GNOME)
   if systemctl is-enabled gdm3 >/dev/null 2>&1; then
     warn "Disabling gdm3 to prefer LightDM..."
     systemctl disable --now gdm3 || true
@@ -850,7 +823,6 @@ make_temp_apt_root() {
 }
 
 apt_cmd_with_root() {
-  # Prints apt-get args to use a temp root (caller should use eval-safe arrays directly)
   local root="$1"
   echo "-o Dir::Etc=${root}/etc/apt -o Dir::Etc::sourcelist=${root}/etc/apt/sources.list -o Dir::Etc::sourceparts=${root}/etc/apt/sources.list.d -o Dir::Etc::preferencesparts=${root}/etc/apt/preferences.d -o Dir::State=${root}/var/lib/apt -o Dir::State::Lists=${root}/var/lib/apt/lists -o Dir::Cache=${root}/var/cache/apt -o Dir::Cache::archives=${root}/var/cache/apt/archives -o APT::Get::List-Cleanup=0"
 }
@@ -866,14 +838,12 @@ plan_mode() {
   local root; root="$(make_temp_apt_root)"
   local plan_log="${LOG_DIR}/plan-$(date +%Y%m%d-%H%M%S).txt"
 
-  # Temp keyring
   local tmp_keyring="${root}/usr/share/keyrings/linuxmint-repo.gpg"
   local old_keyring_out="$KEYRING_OUT"
   KEYRING_OUT="$tmp_keyring"
   install_mint_repo_keyring
   KEYRING_OUT="$old_keyring_out"
 
-  # Temp sources
   local tmp_sources="${root}/etc/apt/sources.list.d/official-package-repositories.list"
   local tmp_pref_base="${root}/etc/apt/preferences.d/50-linuxmint-conversion.pref"
   local tmp_pref_stack="${root}/etc/apt/preferences.d/51-linuxmint-desktop-stack.pref"
@@ -888,7 +858,6 @@ deb ${UBUNTU_ARCHIVE_MIRROR%/} ${UBUNTU_BASE}-backports main restricted universe
 deb ${UBUNTU_SECURITY_MIRROR%/} ${UBUNTU_BASE}-security main restricted universe multiverse
 EOF
 
-  # Pinning in temp root
   cat > "$tmp_pref_base" <<'EOF'
 Package: *
 Pin: origin "packages.linuxmint.com"
@@ -909,13 +878,13 @@ Pin: origin "packages.linuxmint.com"
 Pin-Priority: 1001
 EOF
 
-  # Run update + simulation inside temp root
   export DEBIAN_FRONTEND=noninteractive
   local apt_opts=(); apt_get_opts_common apt_opts
 
-  info "Plan: apt-get update (temp root)..."
   # shellcheck disable=SC2206
   local root_opts=($(apt_cmd_with_root "$root"))
+
+  info "Plan: apt-get update (temp root)..."
   apt-get "${root_opts[@]}" "${apt_opts[@]}" update | tee "$plan_log" >/dev/null
 
   local meta_pkg="mint-meta-${EDITION}"
@@ -953,21 +922,17 @@ convert_mode() {
     warn "--keep-ppas enabled; third-party sources remain active (higher risk)."
   fi
 
-  # Ensure Mint keyring exists (handle overwrite/recreate rules)
   install_mint_repo_keyring
 
-  # Write sources + pinning
   write_mint_sources_system
   write_mint_pinning_system
 
-  # If requested, preserve snap strongly; also treat snapd as "must keep" in simulation checks
   if [[ "$PRESERVE_SNAP" == "yes" ]]; then
     ok "Snap preservation enabled."
   else
     warn "Snap preservation disabled."
   fi
 
-  # Attempt to reduce known conflicts before installing Mint stack
   purge_conflicting_flavors_best_effort
   remove_software_properties_gtk_best_effort
 
@@ -977,7 +942,6 @@ convert_mode() {
   info "APT update..."
   apt-get "${apt_opts[@]}" update
 
-  # Simulation first
   local sim_out="${BACKUP_DIR}/apt-simulate-install.txt"
   local meta_pkg="mint-meta-${EDITION}"
   local pkgs=( "$meta_pkg" mint-meta-core mintsystem mintupdate mintsources mint-meta-codecs )
@@ -986,11 +950,9 @@ convert_mode() {
   apt_simulate_install "$sim_out" "${pkgs[@]}" || true
   apt_sim_abort_if_unsafe "$sim_out"
 
-  # Install Mint stack (with force-overwrite options available if needed)
   info "Installing Mint stack..."
   local apt_force=(); apt_get_opts_force_overwrite apt_force
 
-  # First try normal install; if dpkg conflict hits, retry with force-overwrite.
   if ! apt-get "${apt_opts[@]}" install "${pkgs[@]}"; then
     warn "Initial install failed; retrying with dpkg --force-overwrite (best-effort)..."
     apt-get "${apt_force[@]}" install "${pkgs[@]}" || die "Mint stack install failed even with force-overwrite."
@@ -998,10 +960,8 @@ convert_mode() {
 
   ok "Mint stack installed."
 
-  # Configure display manager + defaults per edition
   configure_lightdm_and_session
 
-  # Post-conversion validation
   post_convert_validate
 
   ok "Conversion complete."
@@ -1029,7 +989,6 @@ post_convert_validate() {
   write_validation_line "$out" "Mint mirror: ${MINT_MIRROR}"
   write_validation_line "$out" "Keyring: ${KEYRING_OUT}"
 
-  # Key packages
   local check_pkgs=( "mintsystem" "mintupdate" "mintsources" "lightdm" "slick-greeter" )
   if [[ "$EDITION" == "cinnamon" ]]; then
     check_pkgs+=( "cinnamon-session" "muffin" "nemo" "cjs" )
@@ -1048,28 +1007,24 @@ post_convert_validate() {
     fi
   done
 
-  # APT sanity
   if apt-get -s check >/dev/null 2>&1; then
     write_validation_line "$out" "APT check: OK"
   else
     write_validation_line "$out" "APT check: FAILED"
   fi
 
-  # LightDM enabled?
   if systemctl is-enabled lightdm >/dev/null 2>&1; then
     write_validation_line "$out" "LightDM: enabled"
   else
     write_validation_line "$out" "LightDM: NOT enabled"
   fi
 
-  # Xsession helper presence (has_option errors usually indicate x11-common issues)
   if [[ -f /etc/X11/Xsession ]]; then
     write_validation_line "$out" "/etc/X11/Xsession: present"
   else
     write_validation_line "$out" "/etc/X11/Xsession: MISSING"
   fi
 
-  # Note: We do not attempt to validate corporate tooling, but record common services if present
   local maybe_services=( "falcon-sensor" "crowdstrike-falcon-sensor" "gpd" "GlobalProtect" "globalprotect" )
   local s=""
   for s in "${maybe_services[@]}"; do
