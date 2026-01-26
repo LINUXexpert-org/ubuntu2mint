@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+
 # ubuntu-to-mint-convert-v3.sh
 #
 # Copyright (C) 2026 LINUXexpert.org
@@ -14,574 +15,583 @@
 #
 # You should have received a copy of the GNU General Public License along
 # with this program. If not, see <https://www.gnu.org/licenses/>.
-#
-# ----------------------------------------------------------------------
-# Purpose:
-#   Keep Ubuntu as the base OS and add Linux Mint repositories + install a
-#   Mint desktop environment, while preserving corporate tooling as much
-#   as possible.
-#
-# Supported:
-#   Ubuntu 24.04 (noble) -> Linux Mint 22.x (default target: zena)
-#   Ubuntu 22.04 (jammy) -> Linux Mint 21.x (default target: virginia)
-#
-# Modes:
-#   doctor
-#   plan
-#   convert --i-accept-the-risk
-#   rollback <backup_dir>
-#
-# X11/Wayland note:
-#   This script defaults to an X11 session (safer for conversions/corp tooling).
-#   You may pass --prefer-wayland, but since this script standardizes on LightDM
-#   (Mint default), it will only select a Wayland session if it is actually
-#   available as a LightDM-compatible Xsession. Otherwise it will warn and use X11.
-# ----------------------------------------------------------------------
 
 set -Eeuo pipefail
 IFS=$'\n\t'
-umask 022
 
-SCRIPT_VERSION="4.3"
+###############################################################################
+# Version / globals
+###############################################################################
+SCRIPT_NAME="$(basename "$0")"
+SCRIPT_VERSION="4.4"
 
 LOG_DIR="/var/log/ubuntu-to-mint"
-mkdir -p "$LOG_DIR"
-LOG_FILE="$LOG_DIR/ubuntu-to-mint-$(date +%Y%m%d-%H%M%S).log"
-exec > >(tee -a "$LOG_FILE") 2>&1
+DEFAULT_MINT_MIRROR="http://packages.linuxmint.com"
+KEYRING_OUT="/usr/share/keyrings/linuxmint-repo.gpg"
+SOURCES_OUT="/etc/apt/sources.list.d/official-package-repositories.list"
+PIN_OUT="/etc/apt/preferences.d/50-linuxmint-conversion.pref"
+PIN_STACK_OUT="/etc/apt/preferences.d/51-linuxmint-desktop-stack.pref"
 
-export LC_ALL=C
+# Safety thresholds
+MAX_ALLOWED_REMOVALS_DEFAULT=40
 
-RED=$'\033[31m'; YEL=$'\033[33m'; GRN=$'\033[32m'; BLU=$'\033[34m'; NC=$'\033[0m'
-BOLD=$'\033[1m'
-
-die() { echo "${RED}ERROR:${NC} $*" >&2; exit 1; }
-warn(){ echo "${YEL}WARN:${NC}  $*" >&2; }
-info(){ echo "${BLU}INFO:${NC}  $*"; }
-ok()  { echo "${GRN}OK:${NC}    $*"; }
-
-# Optional: set to full fingerprint to hard-fail if it doesn't match.
-# Example format: "0123456789ABCDEF0123456789ABCDEF01234567"
-MINT_KEY_FPR_EXPECT="${MINT_KEY_FPR_EXPECT:-}"
-
-ON_ERROR_BACKUP_HINT=""
-on_err() {
-  local line="${1:-?}" code="${2:-?}"
-  echo "${RED}FAILED${NC} at line ${line} (exit ${code})." >&2
-  echo "Command: ${BASH_COMMAND}" >&2
-  [[ -n "${ON_ERROR_BACKUP_HINT}" ]] && echo "Rollback hint: ${ON_ERROR_BACKUP_HINT}" >&2
-  echo "Log: ${LOG_FILE}" >&2
-  exit "$code"
-}
-trap 'on_err "$LINENO" "$?"' ERR
-
-need_root() { [[ ${EUID:-$(id -u)} -eq 0 ]] || die "Run as root (use sudo)."; }
-have_cmd() { command -v "$1" >/dev/null 2>&1; }
-
-# -------------------------
-# UNSUPPORTED DISCLAIMER GATE (CONVERT ONLY)
-# -------------------------
-require_unsupported_disclaimer() {
-  local phrase="I UNDERSTAND THIS IS UNSUPPORTED"
-  echo
-  echo -e "${RED}${BOLD}======================================================================${NC}"
-  echo -e "${RED}${BOLD}   UNSUPPORTED MIGRATION METHOD — PROBABLY A REALLY DUMB IDEA${NC}"
-  echo -e "${RED}${BOLD}======================================================================${NC}"
-  echo -e "${RED}${BOLD}This script attempts to graft Linux Mint repositories/packages onto Ubuntu.${NC}"
-  echo -e "${RED}${BOLD}It is NOT supported by Linux Mint, Canonical, your IT department, or your employer.${NC}"
-  echo -e "${RED}${BOLD}It can break APT, boot/login, device management, VPN/EDR, and leave the system unrecoverable.${NC}"
-  echo -e "${RED}${BOLD}${NC}"
-  echo -e "${RED}${BOLD}Recommended approach: do a CLEAN Linux Mint install and restore your data/apps from backup.${NC}"
-  echo -e "${RED}${BOLD}If this is a corporate-managed device: STOP and get approval first.${NC}"
-  echo -e "${RED}${BOLD}======================================================================${NC}"
-  echo
-  echo "To continue anyway, type exactly:"
-  echo "  ${phrase}"
-  echo "Anything else will abort."
-  echo
-
-  [[ -r /dev/tty ]] || die "No interactive TTY available (/dev/tty not readable). Refusing to proceed."
-  local ans=""
-  read -r -p "> " ans < /dev/tty || die "Unable to read confirmation from TTY."
-  [[ "$ans" == "$phrase" ]] || die "Aborted."
-  ok "Disclaimer acknowledged."
-}
-
-usage() {
-  cat <<'EOF'
-Usage:
-  sudo bash ubuntu-to-mint-convert-v3.sh doctor [--auto-fix]
-  sudo bash ubuntu-to-mint-convert-v3.sh plan   [--auto-fix] [--edition cinnamon|mate|xfce] [--target <mint_codename>] [--mint-mirror <url>] [--with-recommends]
-  sudo bash ubuntu-to-mint-convert-v3.sh convert --i-accept-the-risk [options...]
-  sudo bash ubuntu-to-mint-convert-v3.sh rollback /root/ubuntu-to-mint-backup-YYYYMMDD-HHMMSS
-
-Options:
-  --i-accept-the-risk                   (required for convert)
-  --edition cinnamon|mate|xfce          (default: cinnamon)
-  --target  zena|zara|xia|wilma|virginia|victoria|vera|vanessa
-  --mint-mirror URL                     (default: http://packages.linuxmint.com)
-  --keep-ppas                           (do not disable 3rd-party repos; higher conflict risk)
-  --allow-unhold                        (temporarily unhold packages during convert; risky)
-  --preserve-snap                       (default: yes)
-  --no-preserve-snap                    (disable snap-preservation behavior)
-  --with-recommends                     (default: no; safer for corp systems)
-  --overwrite-keyring                   (always overwrite Mint repo keyring file in-place)
-  --recreate-keyring                    (move existing keyring aside and recreate from scratch)
-  --auto-fix                            (doctor/plan only: allow dpkg/apt repairs and tool installs)
-  --prefer-wayland                      (attempt to prefer a Wayland session if LightDM-compatible; otherwise warn and use X11)
-  --yes                                 (skip interactive confirmation inside convert; does NOT bypass disclaimer)
-EOF
-}
-
-# -------------------------
-# Defaults / arg parsing
-# -------------------------
-MODE="${1:-}"
-[[ -n "$MODE" ]] || { usage; exit 1; }
+# Runtime state
+SUBCMD="${1:-}"
 shift || true
 
-ROLLBACK_DIR=""
-if [[ "$MODE" == "rollback" ]]; then
-  ROLLBACK_DIR="${1:-}"
-  [[ -n "$ROLLBACK_DIR" ]] || die "rollback requires a backup dir argument."
-  shift || true
-fi
-
-EDITION="cinnamon"
+UBUNTU_BASE=""
+DEFAULT_MINT=""
+ALLOWED_TARGETS=""
 TARGET_MINT=""
-MINT_MIRROR="http://packages.linuxmint.com"
+EDITION="cinnamon"
+MINT_MIRROR="$DEFAULT_MINT_MIRROR"
 KEEP_PPAS="no"
-ALLOW_UNHOLD="no"
 PRESERVE_SNAP="yes"
 WITH_RECOMMENDS="no"
 ASSUME_YES="no"
-ACCEPT_RISK="no"
-AUTO_FIX="no"
-KEYRING_MODE="auto"   # auto|overwrite|recreate
-PREFER_WAYLAND="no"
+RISK_ACK_FLAG="no"
+PREFER_WAYLAND="no"   # With LightDM we will force X11 anyway.
+OVERWRITE_KEYRING="no" # overwrite keyring file if exists
+RECREATE_KEYRING="no"  # delete+recreate keyring if exists (back it up)
+AUTO_FIX="yes"         # attempt basic dpkg/apt repair pre-flight
+PURGE_CONFLICTING_FLAVORS="yes"  # purge ubuntucinnamon / flavor meta packages that break Mint DE
+MAX_ALLOWED_REMOVALS="$MAX_ALLOWED_REMOVALS_DEFAULT"
 
-while [[ $# -gt 0 ]]; do
-  case "$1" in
-    --i-accept-the-risk) ACCEPT_RISK="yes"; shift;;
-    --edition) EDITION="${2:-}"; shift 2;;
-    --target)  TARGET_MINT="${2:-}"; shift 2;;
-    --mint-mirror) MINT_MIRROR="${2:-}"; shift 2;;
-    --keep-ppas) KEEP_PPAS="yes"; shift;;
-    --allow-unhold) ALLOW_UNHOLD="yes"; shift;;
-    --preserve-snap) PRESERVE_SNAP="yes"; shift;;
-    --no-preserve-snap) PRESERVE_SNAP="no"; shift;;
-    --with-recommends) WITH_RECOMMENDS="yes"; shift;;
-    --overwrite-keyring) KEYRING_MODE="overwrite"; shift;;
-    --recreate-keyring) KEYRING_MODE="recreate"; shift;;
-    --auto-fix) AUTO_FIX="yes"; shift;;
-    --prefer-wayland) PREFER_WAYLAND="yes"; shift;;
-    --yes) ASSUME_YES="yes"; shift;;
-    -h|--help) usage; exit 0;;
-    *) die "Unknown arg: $1 (use --help)";;
-  esac
-done
+BACKUP_DIR=""
+ON_ERROR_BACKUP_HINT=""
 
-validate_choice() {
-  case "$1" in
-    cinnamon|mate|xfce) ;;
-    *) die "Invalid --edition '$1' (use cinnamon|mate|xfce)";;
-  esac
+###############################################################################
+# Pretty output helpers
+###############################################################################
+is_tty() { [[ -t 1 ]]; }
+
+c_reset=""; c_red=""; c_grn=""; c_ylw=""; c_blu=""; c_bold=""
+if is_tty; then
+  c_reset="$(printf '\033[0m')"
+  c_red="$(printf '\033[31m')"
+  c_grn="$(printf '\033[32m')"
+  c_ylw="$(printf '\033[33m')"
+  c_blu="$(printf '\033[34m')"
+  c_bold="$(printf '\033[1m')"
+fi
+
+ts() { date -Is; }
+info() { echo "${c_blu}INFO:${c_reset}  $*"; }
+ok()   { echo "${c_grn}OK:${c_reset}    $*"; }
+warn() { echo "${c_ylw}WARN:${c_reset}  $*"; }
+err()  { echo "${c_red}ERROR:${c_reset} $*"; }
+
+die() {
+  err "$*"
+  [[ -n "${ON_ERROR_BACKUP_HINT:-}" ]] && echo -e "\nRollback hint: ${ON_ERROR_BACKUP_HINT}"
+  exit 1
 }
 
-validate_mirror() {
-  [[ "$MINT_MIRROR" =~ ^https?:// ]] || die "--mint-mirror must start with http:// or https://"
+have_cmd() { command -v "$1" >/dev/null 2>&1; }
+
+###############################################################################
+# Logging + traps
+###############################################################################
+LOG_FILE=""
+setup_logging() {
+  mkdir -p "$LOG_DIR"
+  LOG_FILE="${LOG_DIR}/ubuntu-to-mint-$(date +%Y%m%d-%H%M%S).log"
+  # tee while preserving stderr
+  exec > >(tee -a "$LOG_FILE") 2>&1
+  info "Script v${SCRIPT_VERSION}"
+  info "Log: ${LOG_FILE}"
 }
 
-read_os_release() {
-  [[ -r /etc/os-release ]] || die "/etc/os-release missing"
+on_err() {
+  local exit_code=$?
+  local line_no=${BASH_LINENO[0]:-?}
+  local cmd=${BASH_COMMAND:-?}
+  err "FAILED at line ${line_no} (exit ${exit_code})."
+  err "Command: ${cmd}"
+  [[ -n "${LOG_FILE:-}" ]] && err "Log: ${LOG_FILE}"
+  [[ -n "${ON_ERROR_BACKUP_HINT:-}" ]] && echo -e "\nRollback hint: ${ON_ERROR_BACKUP_HINT}"
+  exit "$exit_code"
+}
+trap on_err ERR
+
+###############################################################################
+# Usage
+###############################################################################
+usage() {
+  cat <<EOF
+${SCRIPT_NAME} v${SCRIPT_VERSION}
+
+High-risk, best-effort in-place "Ubuntu -> Mint desktop/tooling" graft.
+Ubuntu remains the base OS; Mint repos+packages are added with pinning.
+
+Usage:
+  sudo bash ${SCRIPT_NAME} doctor
+  sudo bash ${SCRIPT_NAME} plan [options]
+  sudo bash ${SCRIPT_NAME} convert --i-accept-the-risk [options]
+  sudo bash ${SCRIPT_NAME} rollback /root/ubuntu-to-mint-backup-YYYYMMDD-HHMMSS
+
+Options:
+  --edition cinnamon|mate|xfce     (default: cinnamon)
+  --target <mint_codename>         Override Mint target codename (validated per Ubuntu base)
+  --mint-mirror <url>              (default: ${DEFAULT_MINT_MIRROR})
+
+  --keep-ppas                      Do NOT disable third-party APT sources (not recommended)
+  --preserve-snap / --no-preserve-snap   (default: preserve snap)
+  --with-recommends                Allow recommended packages during install (default: off)
+  --yes                            Skip most interactive prompts (convert still requires disclaimer + --i-accept-the-risk)
+  --max-removals N                 Abort if APT simulation removes more than N packages (default: ${MAX_ALLOWED_REMOVALS_DEFAULT})
+
+  --overwrite-keyring              If ${KEYRING_OUT} exists, overwrite it
+  --recreate-keyring               Backup+delete ${KEYRING_OUT} then recreate it
+
+  --no-auto-fix                    Do not attempt dpkg/apt repair pre-flight
+  --no-purge-flavor                Do not purge conflicting Ubuntu-flavor packages (ubuntucinnamon*, etc.)
+
+Notes:
+  * "convert" will force LightDM + X11 session by default (Mint-style). Wayland is not used by LightDM.
+EOF
+}
+
+###############################################################################
+# Argument parsing
+###############################################################################
+parse_args() {
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --edition)
+        EDITION="${2:-}"; shift 2 ;;
+      --target)
+        TARGET_MINT="${2:-}"; shift 2 ;;
+      --mint-mirror)
+        MINT_MIRROR="${2:-}"; shift 2 ;;
+      --keep-ppas)
+        KEEP_PPAS="yes"; shift ;;
+      --preserve-snap)
+        PRESERVE_SNAP="yes"; shift ;;
+      --no-preserve-snap)
+        PRESERVE_SNAP="no"; shift ;;
+      --with-recommends)
+        WITH_RECOMMENDS="yes"; shift ;;
+      --yes)
+        ASSUME_YES="yes"; shift ;;
+      --i-accept-the-risk)
+        RISK_ACK_FLAG="yes"; shift ;;
+      --overwrite-keyring)
+        OVERWRITE_KEYRING="yes"; shift ;;
+      --recreate-keyring)
+        RECREATE_KEYRING="yes"; shift ;;
+      --no-auto-fix)
+        AUTO_FIX="no"; shift ;;
+      --no-purge-flavor)
+        PURGE_CONFLICTING_FLAVORS="no"; shift ;;
+      --max-removals)
+        MAX_ALLOWED_REMOVALS="${2:-}"; shift 2 ;;
+      -h|--help|help)
+        usage; exit 0 ;;
+      *)
+        die "Unknown argument: $1 (use --help)" ;;
+    esac
+  done
+
+  case "$EDITION" in
+    cinnamon|mate|xfce) : ;;
+    *) die "--edition must be cinnamon|mate|xfce" ;;
+  esac
+
+  [[ "$MAX_ALLOWED_REMOVALS" =~ ^[0-9]+$ ]] || die "--max-removals must be an integer"
+}
+
+###############################################################################
+# System checks
+###############################################################################
+require_root() {
+  [[ "${EUID}" -eq 0 ]] || die "Run as root (use sudo)."
+}
+
+detect_os() {
+  [[ -r /etc/os-release ]] || die "Missing /etc/os-release"
   # shellcheck disable=SC1091
   . /etc/os-release
-  OS_ID="${ID:-}"
-  OS_NAME="${NAME:-}"
-  OS_VERSION_CODENAME="${VERSION_CODENAME:-}"
-  OS_VERSION_ID="${VERSION_ID:-}"
-}
 
-have_regular_file_or_die() {
-  local p="$1"
-  if [[ -e "$p" && ! -f "$p" ]]; then
-    die "Expected regular file at '$p' but found non-regular (dir/symlink/device). Fix it before proceeding."
-  fi
-}
+  local id="${ID:-}"
+  local ver="${VERSION_ID:-}"
+  local codename="${VERSION_CODENAME:-${UBUNTU_CODENAME:-}}"
 
-detect_ubuntu_codename() {
-  local c=""
-  if have_cmd lsb_release; then c="$(lsb_release -cs 2>/dev/null || true)"; fi
-  [[ -n "$c" ]] || c="${OS_VERSION_CODENAME:-}"
-  [[ -n "$c" ]] || die "Could not determine Ubuntu codename."
-  echo "$c"
-}
+  info "Detected OS: ${NAME:-unknown} (ID=${id}, VERSION_ID=${ver}, CODENAME=${codename})"
 
-set_targets_from_ubuntu() {
-  UBUNTU_CODENAME="$(detect_ubuntu_codename)"
-  local -a ALLOWED_TARGETS=()
-  case "$UBUNTU_CODENAME" in
+  [[ "$id" == "ubuntu" ]] || die "This script only supports Ubuntu as the base (ID=ubuntu)."
+
+  case "$codename" in
     noble)
       UBUNTU_BASE="noble"
       DEFAULT_MINT="zena"
-      ALLOWED_TARGETS=(zena zara xia wilma)
+      ALLOWED_TARGETS="zena zara xia wilma"
       ;;
     jammy)
       UBUNTU_BASE="jammy"
       DEFAULT_MINT="virginia"
-      ALLOWED_TARGETS=(virginia victoria vera vanessa)
+      ALLOWED_TARGETS="virginia victoria vera vanessa"
       ;;
     *)
-      die "Unsupported Ubuntu codename '$UBUNTU_CODENAME'. Supports Ubuntu noble (24.04) or jammy (22.04) only."
+      die "Unsupported Ubuntu codename '${codename}'. Supported: noble (24.04), jammy (22.04)."
       ;;
   esac
 
-  [[ -n "$TARGET_MINT" ]] || TARGET_MINT="$DEFAULT_MINT"
+  if [[ -z "$TARGET_MINT" ]]; then
+    TARGET_MINT="$DEFAULT_MINT"
+  fi
 
   local ok_target="no"
-  for t in "${ALLOWED_TARGETS[@]}"; do
-    [[ "$TARGET_MINT" == "$t" ]] && ok_target="yes" && break
+  for t in $ALLOWED_TARGETS; do
+    [[ "$TARGET_MINT" == "$t" ]] && ok_target="yes"
   done
-  if [[ "$ok_target" != "yes" ]]; then
-    local allowed_str
-    printf -v allowed_str '%s ' "${ALLOWED_TARGETS[@]}"
-    allowed_str="${allowed_str% }"
-    die "--target '$TARGET_MINT' not allowed for Ubuntu '$UBUNTU_CODENAME'. Allowed: $allowed_str"
-  fi
+  [[ "$ok_target" == "yes" ]] || die "--target '${TARGET_MINT}' not allowed for Ubuntu '${UBUNTU_BASE}'. Allowed: ${ALLOWED_TARGETS}"
+
+  info "Ubuntu base: ${UBUNTU_BASE} | Target Mint codename: ${TARGET_MINT} | Edition: ${EDITION}"
 }
 
-detect_ubuntu_mirrors() {
-  local sources_txt=""
-  if [[ -r /etc/apt/sources.list ]]; then
-    sources_txt+="$(grep -E '^[[:space:]]*deb ' /etc/apt/sources.list || true)"$'\n'
-  fi
-  if compgen -G "/etc/apt/sources.list.d/*.list" >/dev/null; then
-    sources_txt+="$(grep -RhsE '^[[:space:]]*deb ' /etc/apt/sources.list.d/*.list || true)"$'\n'
-  fi
-  if compgen -G "/etc/apt/sources.list.d/*.sources" >/dev/null; then
-    sources_txt+="$(grep -RhsE '^[[:space:]]*URIs:[[:space:]]*' /etc/apt/sources.list.d/*.sources | awk '{print $2}' || true)"$'\n'
-  fi
-
-  UBUNTU_ARCHIVE_MIRROR="http://archive.ubuntu.com/ubuntu"
-  UBUNTU_SECURITY_MIRROR="http://security.ubuntu.com/ubuntu"
-
-  local m
-  m="$(echo "$sources_txt" | grep -Eo 'https?://[^ ]+/ubuntu' | head -n1 || true)"
-  [[ -n "$m" ]] && UBUNTU_ARCHIVE_MIRROR="$m"
-
-  info "Ubuntu archive mirror:  ${UBUNTU_ARCHIVE_MIRROR}"
-  info "Ubuntu security mirror: ${UBUNTU_SECURITY_MIRROR}"
-}
-
-apt_fix_broken_overwrite() {
-  DEBIAN_FRONTEND=noninteractive apt-get -y -f install \
-    -o Dpkg::Options::=--force-overwrite \
-    -o Dpkg::Options::=--force-confdef \
-    -o Dpkg::Options::=--force-confold || true
-  DEBIAN_FRONTEND=noninteractive dpkg --configure -a || true
-  DEBIAN_FRONTEND=noninteractive apt-get -y -f install \
-    -o Dpkg::Options::=--force-overwrite \
-    -o Dpkg::Options::=--force-confdef \
-    -o Dpkg::Options::=--force-confold || true
-}
-
-ensure_tools() {
-  # ensure_tools <allow_changes yes|no> <tool1> <tool2> ...
-  local allow="$1"; shift
-  local missing=()
-  local t
-  for t in "$@"; do
-    have_cmd "$t" || missing+=("$t")
-  done
-  if [[ ${#missing[@]} -eq 0 ]]; then
-    return 0
-  fi
-
-  if [[ "$allow" == "yes" ]]; then
-    info "Installing required tools: ${missing[*]}"
-    DEBIAN_FRONTEND=noninteractive apt-get update -o Acquire::Retries=3
-    DEBIAN_FRONTEND=noninteractive apt-get install -y ca-certificates curl gnupg dirmngr
-    for t in "$@"; do
-      have_cmd "$t" || die "Tool install failed; still missing: $t"
-    done
-    return 0
-  fi
-
-  die "Missing required tools (${missing[*]}). Install them first or re-run with --auto-fix."
-}
-
-preflight_common() {
-  # preflight_common <allow_changes yes|no>
-  local allow_changes="$1"
-
-  need_root
-  validate_choice "$EDITION"
-  validate_mirror
-  read_os_release
-
-  info "Script v${SCRIPT_VERSION}"
-  info "Detected OS: ${OS_NAME} (ID=${OS_ID}, VERSION_ID=${OS_VERSION_ID}, CODENAME=${OS_VERSION_CODENAME})"
-  [[ "$OS_ID" == "ubuntu" ]] || die "This script is intended for Ubuntu (ID=ubuntu). Detected ID=${OS_ID}."
-
-  set_targets_from_ubuntu
-  ok "Ubuntu base: ${UBUNTU_BASE} | Target Mint codename: ${TARGET_MINT} | Edition: ${EDITION} | Prefer Wayland: ${PREFER_WAYLAND}"
-
-  for l in /var/lib/dpkg/lock /var/lib/dpkg/lock-frontend /var/lib/apt/lists/lock /var/cache/apt/archives/lock; do
+check_apt_locks() {
+  local locks=(
+    "/var/lib/dpkg/lock"
+    "/var/lib/dpkg/lock-frontend"
+    "/var/lib/apt/lists/lock"
+    "/var/cache/apt/archives/lock"
+  )
+  for l in "${locks[@]}"; do
     if [[ -e "$l" ]] && fuser "$l" >/dev/null 2>&1; then
-      die "APT/DPKG lock is held ($l). Close updaters and try again."
+      die "APT/dpkg lock active on ${l}. Close Software Updater/apt/dpkg and retry."
     fi
   done
+}
+
+apt_fix_basic() {
+  info "Attempting basic dpkg/apt repair (best-effort)..."
+  export DEBIAN_FRONTEND=noninteractive
+  dpkg --configure -a || true
+  apt-get -y -f install || true
+  apt-get -y --fix-broken install || true
+  apt-get -y update || true
+  ok "Basic repair attempt complete."
+}
+
+doctor_report() {
+  info "Doctor checks:"
+  check_apt_locks
+
+  local holds
+  holds="$(apt-mark showhold 2>/dev/null || true)"
+  if [[ -n "$holds" ]]; then
+    warn "Held packages detected:"
+    echo "$holds"
+  else
+    ok "No held packages detected."
+  fi
 
   if dpkg --audit | grep -q .; then
-    if [[ "$allow_changes" == "yes" ]]; then
-      warn "dpkg reports issues. Attempting to fix..."
-      DEBIAN_FRONTEND=noninteractive dpkg --configure -a || true
-      apt_fix_broken_overwrite
-    else
-      warn "dpkg reports issues (doctor/plan won't modify). Run: sudo dpkg --configure -a && sudo apt-get -f install"
-    fi
-  fi
-
-  if ! apt-get check >/dev/null 2>&1; then
-    if [[ "$allow_changes" == "yes" ]]; then
-      warn "apt-get check failed. Attempting best-effort repair..."
-      apt_fix_broken_overwrite
-      apt-get check >/dev/null 2>&1 || warn "apt-get check still failing; conversion may fail."
-    else
-      warn "apt-get check failed (doctor/plan won't modify). Fix before converting."
-    fi
-  fi
-
-  local root_free
-  root_free="$(df -Pm / | awk 'NR==2{print $4}')"
-  [[ "${root_free:-0}" -ge 6144 ]] || warn "Low free space on / (${root_free} MB). Recommend >= 6GB free."
-
-  if [[ "$MODE" == "plan" || "$MODE" == "convert" ]]; then
-    ensure_tools "$allow_changes" curl gpg
+    warn "dpkg reports issues:"
+    dpkg --audit || true
   else
-    have_cmd curl || warn "curl not found (recommended)."
-    have_cmd gpg  || warn "gpg not found (recommended)."
+    ok "dpkg --audit clean."
   fi
 
-  if have_cmd curl; then
-    curl -fsS --connect-timeout 10 --max-time 30 "${MINT_MIRROR%/}/" >/dev/null || warn "Cannot reach Mint mirror ${MINT_MIRROR} (may be blocked/proxy)."
-  fi
-
-  ok "Preflight completed."
-}
-
-# -------------------------
-# Keyring helpers
-# -------------------------
-keyring_contains_keyid() {
-  local keyring="$1"
-  local keyid="${2^^}"
-
-  [[ -s "$keyring" ]] || return 1
-  have_regular_file_or_die "$keyring"
-  have_cmd gpg || return 1
-
-  local gh
-  gh="$(mktemp -d)"
-  chmod 700 "$gh"
-
-  local found="no"
-  if gpg --homedir "$gh" --batch --no-default-keyring --keyring "$keyring" --with-colons --list-keys 2>/dev/null \
-      | awk -F: '$1=="pub"||$1=="sub"{print toupper($5)}' \
-      | grep -q "${keyid}"; then
-    found="yes"
-  fi
-
-  rm -rf "$gh"
-  [[ "$found" == "yes" ]]
-}
-
-get_key_fingerprint_from_keyring() {
-  local keyring="$1"
-  have_cmd gpg || return 1
-  [[ -s "$keyring" ]] || return 1
-
-  local gh
-  gh="$(mktemp -d)"
-  chmod 700 "$gh"
-  local fpr
-  fpr="$(gpg --homedir "$gh" --batch --no-default-keyring --keyring "$keyring" --with-colons --list-keys 2>/dev/null \
-        | awk -F: '$1=="fpr"{print toupper($10); exit}' || true)"
-  rm -rf "$gh"
-  [[ -n "$fpr" ]] || return 1
-  echo "$fpr"
-}
-
-backup_existing_keyring() {
-  local keyring="$1"
-  local bdir="${LOG_DIR}/keyring-backups"
-  mkdir -p "$bdir"
-  local ts
-  ts="$(date +%Y%m%d-%H%M%S)"
-  local dest="${bdir}/$(basename "$keyring").${ts}.bak"
-  cp -a "$keyring" "$dest"
-  ok "Backed up existing keyring to: $dest"
-}
-
-# -------------------------
-# Key handling (HKPS -> HKP:80 -> HTTPS fallback) + atomic write (same dir)
-# FIXED: do not dearmor to an already-existing file; validate OpenPGP data
-# -------------------------
-mint_repo_key_write_to() {
-  # mint_repo_key_write_to <out_keyring> <allow_changes yes|no>
-  local out_keyring="$1"
-  local allow_changes="${2:-no}"
-  local keyid="A6616109451BBBF2"
-
-  [[ -n "$out_keyring" ]] || die "mint_repo_key_write_to requires an output path"
-  ensure_tools "$allow_changes" curl gpg
-
-  local out_dir
-  out_dir="$(dirname "$out_keyring")"
-  mkdir -p "$out_dir"
-
-  # Temp dir on same filesystem for atomic mv; output file does NOT exist yet.
-  local tmp_dir tmp_out
-  tmp_dir="$(mktemp -d -p "$out_dir" ".linuxmint-repo.gpg.tmp.XXXXXX")"
-  tmp_out="${tmp_dir}/linuxmint-repo.gpg"
-
-  local gnupghome
-  gnupghome="$(mktemp -d)"
-  chmod 700 "$gnupghome"
-
-  local -a ks_opts=()
-  if [[ -n "${http_proxy:-}" ]]; then
-    ks_opts+=(--keyserver-options "http-proxy=${http_proxy}")
-  elif [[ -n "${https_proxy:-}" ]]; then
-    ks_opts+=(--keyserver-options "http-proxy=${https_proxy}")
-  fi
-
-  local got="no"
-  if gpg --homedir "$gnupghome" --batch "${ks_opts[@]}" --keyserver hkps://keyserver.ubuntu.com --recv-keys "$keyid" >/dev/null 2>&1; then
-    got="yes"
-  elif gpg --homedir "$gnupghome" --batch "${ks_opts[@]}" --keyserver hkp://keyserver.ubuntu.com:80 --recv-keys "$keyid" >/dev/null 2>&1; then
-    got="yes"
-  fi
-
-  if [[ "$got" == "yes" ]]; then
-    gpg --homedir "$gnupghome" --batch --export "$keyid" \
-      | gpg --batch --yes --dearmor -o "$tmp_out" \
-      || { rm -rf "$gnupghome" "$tmp_dir"; die "Failed to export+dearmor Mint repo key from keyserver."; }
+  if apt-get -s check >/dev/null 2>&1; then
+    ok "apt-get check: OK"
   else
-    info "Keyserver blocked; fetching key over HTTPS from Ubuntu keyserver (exact match)..."
-    local armored="$gnupghome/linuxmint-repo.asc"
+    warn "apt-get check reports problems."
+  fi
 
-    if ! curl -fsSL --connect-timeout 10 --max-time 30 \
-        -H "Accept: application/pgp-keys" \
-        "https://keyserver.ubuntu.com/pks/lookup?op=get&search=0x${keyid}&exact=on" -o "$armored"; then
-      curl -fsSL --connect-timeout 10 --max-time 30 \
-        -H "Accept: application/pgp-keys" \
-        "http://keyserver.ubuntu.com/pks/lookup?op=get&search=0x${keyid}&exact=on" -o "$armored" \
-        || { rm -rf "$gnupghome" "$tmp_dir"; die "Unable to fetch Mint repo key via keyserver or HTTPS fallback."; }
+  ok "Doctor complete."
+}
+
+###############################################################################
+# Backup / rollback
+###############################################################################
+backup_system_state() {
+  local dir="/root/ubuntu-to-mint-backup-$(date +%Y%m%d-%H%M%S)"
+  mkdir -p "$dir"
+  info "Creating backup at: ${dir}"
+
+  mkdir -p "${dir}/etc"
+  cp -a /etc/apt "${dir}/etc/" || true
+  cp -a /etc/os-release /etc/lsb-release 2>/dev/null "${dir}/etc/" || true
+  cp -a /etc/fstab /etc/hostname /etc/hosts 2>/dev/null "${dir}/etc/" || true
+
+  dpkg-query -W -f='${Package}\t${Version}\n' > "${dir}/dpkg-packages.tsv" || true
+  apt-mark showmanual > "${dir}/apt-manual.txt" || true
+  apt-mark showhold > "${dir}/apt-holds.txt" || true
+  systemctl list-unit-files --state=enabled > "${dir}/enabled-services.txt" || true
+
+  if have_cmd snap; then snap list > "${dir}/snap-list.txt" || true; fi
+  if have_cmd flatpak; then flatpak list > "${dir}/flatpak-list.txt" || true; fi
+
+  ok "Backup complete."
+  echo "$dir"
+}
+
+rollback_from_backup() {
+  local dir="${1:-}"
+  [[ -n "$dir" ]] || die "rollback requires a backup directory path."
+  [[ -d "$dir" ]] || die "Backup directory not found: $dir"
+  [[ -d "${dir}/etc/apt" ]] || die "Backup missing ${dir}/etc/apt"
+
+  info "Restoring /etc/apt from backup: ${dir}"
+  rm -rf /etc/apt
+  cp -a "${dir}/etc/apt" /etc/apt
+  ok "APT config restored."
+
+  info "Running apt-get update + fix-broken (best-effort)..."
+  export DEBIAN_FRONTEND=noninteractive
+  apt-get -y update || true
+  apt-get -y -f install || true
+  ok "Rollback complete. Reboot recommended."
+}
+
+timeshift_snapshot_best_effort() {
+  if have_cmd timeshift; then
+    info "Timeshift detected. Attempting pre-change snapshot (best-effort)..."
+    timeshift --create --comments "pre ubuntu->mint ${EDITION} $(date -Is)" --tags D \
+      || warn "Timeshift snapshot failed (may not be configured)."
+  else
+    warn "Timeshift not installed. Strongly recommended to snapshot/backup before converting."
+  fi
+}
+
+###############################################################################
+# Third-party sources handling
+###############################################################################
+is_enterprise_allowlisted_source() {
+  # Avoid disabling common corporate agents repos
+  # (CrowdStrike, Palo Alto GlobalProtect, etc.)
+  local f="$1"
+  grep -Eqi '(crowdstrike|falcon|paloaltonetworks|globalprotect|pan-gp|pan-globalprotect|zscaler|netskope|sentinelone)' "$f" 2>/dev/null
+}
+
+disable_thirdparty_sources_system() {
+  local backup_dir="$1"
+  local disabled_dir="${backup_dir}/disabled-sources"
+  mkdir -p "$disabled_dir"
+
+  info "Disabling 3rd-party sources into: ${disabled_dir}"
+  shopt -s nullglob
+  for f in /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources; do
+    [[ "$(basename "$f")" == "$(basename "$SOURCES_OUT")" ]] && continue
+    if [[ "$KEEP_PPAS" == "yes" ]]; then
+      continue
     fi
-
-    grep -q "BEGIN PGP PUBLIC KEY BLOCK" "$armored" \
-      || { rm -rf "$gnupghome" "$tmp_dir"; die "Downloaded content is not a PGP public key block (proxy portal/HTML?)."; }
-
-    local keyinfo
-    if ! keyinfo="$(gpg --batch --with-colons --show-keys "$armored" 2>/dev/null)"; then
-      rm -rf "$gnupghome" "$tmp_dir"
-      die "Downloaded key block is not valid OpenPGP data (gpg cannot parse it)."
+    if is_enterprise_allowlisted_source "$f"; then
+      warn "Keeping allowlisted corporate source: $f"
+      continue
     fi
+    mv -v "$f" "${disabled_dir}/" || true
+  done
+  shopt -u nullglob
 
-    if ! awk -F: '$1=="pub"||$1=="sub"{print toupper($5)}' <<<"$keyinfo" | grep -q "${keyid^^}"; then
-      rm -rf "$gnupghome" "$tmp_dir"
-      die "Fetched key does not contain expected keyid ${keyid^^}"
-    fi
+  ok "Third-party sources disabled (restorable via rollback)."
+}
 
-    gpg --batch --yes --dearmor -o "$tmp_out" "$armored" \
-      || { rm -rf "$gnupghome" "$tmp_dir"; die "Failed to dearmor downloaded key block."; }
+###############################################################################
+# Mint keyring retrieval (NO keyserver dependency by default)
+###############################################################################
+ensure_deps_for_keyring() {
+  export DEBIAN_FRONTEND=noninteractive
+  apt-get -y update
+  apt-get -y install ca-certificates curl gnupg dirmngr dpkg-dev >/dev/null
+}
+
+keyring_from_installed_package() {
+  # If linuxmint-keyring is installed, copy the keyring file(s) from it.
+  if ! dpkg -s linuxmint-keyring >/dev/null 2>&1; then
+    return 1
+  fi
+
+  local files
+  files="$(dpkg -L linuxmint-keyring 2>/dev/null | grep -E '/usr/share/keyrings/.*\.(gpg|asc)$' || true)"
+  [[ -n "$files" ]] || return 1
+
+  local src
+  src="$(echo "$files" | grep -E '\.gpg$' | head -n 1 || true)"
+  if [[ -z "$src" ]]; then
+    src="$(echo "$files" | head -n 1)"
+  fi
+  [[ -r "$src" ]] || return 1
+
+  echo "$src"
+  return 0
+}
+
+fetch_latest_linuxmint_keyring_deb() {
+  local pool_base="${MINT_MIRROR%/}/pool/main/l/linuxmint-keyring/"
+  local tmpdir="$1"
+  mkdir -p "$tmpdir"
+
+  # Try HTTPS first, then HTTP.
+  local index=""
+  if index="$(curl -fsSL "https://$(echo "$pool_base" | sed 's|^http://||')" 2>/dev/null)"; then
+    :
+  elif index="$(curl -fsSL "$pool_base" 2>/dev/null)"; then
+    :
+  else
+    return 1
+  fi
+
+  # Extract deb names
+  local debs
+  debs="$(echo "$index" | grep -oE 'linuxmint-keyring_[0-9A-Za-z.+:~_-]+_all\.deb' | sort -Vu | uniq || true)"
+  [[ -n "$debs" ]] || return 1
+
+  local deb
+  deb="$(echo "$debs" | tail -n 1)"
+  local url="${pool_base}${deb}"
+
+  info "Downloading linuxmint-keyring package: ${deb}"
+  if ! curl -fsSL "$url" -o "${tmpdir}/${deb}"; then
+    # attempt https variant if pool_base was http
+    local https_url="https://$(echo "$url" | sed 's|^http://||')"
+    curl -fsSL "$https_url" -o "${tmpdir}/${deb}" || return 1
+  fi
+
+  echo "${tmpdir}/${deb}"
+  return 0
+}
+
+extract_keyring_from_deb_to() {
+  local deb_path="$1"
+  local out_keyring="$2"
+
+  [[ -r "$deb_path" ]] || die "Keyring deb not readable: $deb_path"
+  [[ -n "$out_keyring" ]] || die "extract_keyring_from_deb_to requires output path"
+
+  local tmpdir
+  tmpdir="$(mktemp -d)"
+  chmod 700 "$tmpdir"
+
+  dpkg-deb -x "$deb_path" "$tmpdir"
+
+  local candidate=""
+  if [[ -d "$tmpdir/usr/share/keyrings" ]]; then
+    candidate="$(find "$tmpdir/usr/share/keyrings" -maxdepth 1 -type f -name '*.gpg' | head -n 1 || true)"
+  fi
+
+  if [[ -z "$candidate" ]]; then
+    # maybe shipped as .asc
+    candidate="$(find "$tmpdir/usr/share/keyrings" -maxdepth 1 -type f -name '*.asc' | head -n 1 || true)"
+  fi
+
+  [[ -n "$candidate" ]] || die "Could not find Mint keyring inside linuxmint-keyring deb."
+
+  mkdir -p "$(dirname "$out_keyring")"
+
+  local tmp_out
+  tmp_out="$(mktemp)"
+  rm -f "$tmp_out" 2>/dev/null || true
+
+  if [[ "$candidate" == *.gpg ]]; then
+    cp -f "$candidate" "$tmp_out"
+  else
+    # .asc -> dearmor
+    grep -q "BEGIN PGP PUBLIC KEY BLOCK" "$candidate" \
+      || die "Extracted key file does not look like an armored PGP public key."
+    gpg --batch --dearmor -o "$tmp_out" "$candidate"
   fi
 
   chmod 644 "$tmp_out"
   mv -f "$tmp_out" "$out_keyring"
   chmod 644 "$out_keyring"
-  rm -rf "$gnupghome" "$tmp_dir"
 
-  local fpr
-  fpr="$(get_key_fingerprint_from_keyring "$out_keyring" || true)"
-  [[ -n "$fpr" ]] || die "Unable to read fingerprint from written keyring: $out_keyring"
-  info "Mint repo key fingerprint installed: $fpr"
-
-  if [[ -n "$MINT_KEY_FPR_EXPECT" ]]; then
-    [[ "${fpr^^}" == "${MINT_KEY_FPR_EXPECT^^}" ]] || die "Mint key fingerprint mismatch. Expected ${MINT_KEY_FPR_EXPECT^^}, got ${fpr^^}"
-  fi
+  rm -rf "$tmpdir"
 }
 
-mint_repo_key_install() {
-  local keyring="/usr/share/keyrings/linuxmint-repo.gpg"
-  local keyid="A6616109451BBBF2"
+mint_repo_key_write_to() {
+  local out_keyring="$1"
+  [[ -n "$out_keyring" ]] || die "mint_repo_key_write_to requires an output path"
 
-  have_regular_file_or_die "$keyring"
+  ensure_deps_for_keyring
 
-  if [[ -e "$keyring" ]]; then
-    case "$KEYRING_MODE" in
-      recreate)
-        warn "Mint keyring already exists at ${keyring}; recreating as requested."
-        [[ -s "$keyring" ]] && backup_existing_keyring "$keyring" || true
-        rm -f "$keyring"
-        ;;
-      overwrite)
-        warn "Mint keyring already exists at ${keyring}; overwriting in-place as requested."
-        ;;
-      auto)
-        if [[ -s "$keyring" ]] && keyring_contains_keyid "$keyring" "$keyid"; then
-          ok "Mint keyring already present and contains expected key (${keyid})."
-          return 0
-        fi
-        warn "Mint keyring exists but is missing/invalid or does not contain expected key (${keyid}); recreating safely."
-        [[ -s "$keyring" ]] && backup_existing_keyring "$keyring" || true
-        rm -f "$keyring"
-        ;;
-      *)
-        die "Internal error: unknown KEYRING_MODE=${KEYRING_MODE}"
-        ;;
-    esac
+  # Handle existing file behavior
+  if [[ -e "$out_keyring" ]]; then
+    if [[ "$RECREATE_KEYRING" == "yes" ]]; then
+      local bak="${out_keyring}.$(date +%Y%m%d-%H%M%S).bak"
+      warn "Recreating keyring: backing up existing to ${bak}"
+      cp -a "$out_keyring" "$bak" || true
+      rm -f "$out_keyring"
+    elif [[ "$OVERWRITE_KEYRING" == "yes" ]]; then
+      warn "Overwriting existing keyring at ${out_keyring}"
+      :
+    else
+      # Validate it looks like a keyring; if yes, keep it.
+      if gpg --batch --quiet --show-keys "$out_keyring" >/dev/null 2>&1; then
+        ok "Existing Mint keyring looks valid; keeping ${out_keyring} (use --overwrite-keyring or --recreate-keyring to replace)."
+        return 0
+      fi
+      die "Existing keyring at ${out_keyring} is not readable by gpg. Use --recreate-keyring to rebuild it."
+    fi
   fi
 
-  info "Installing Linux Mint repo signing key into ${keyring}"
-  mint_repo_key_write_to "$keyring" "yes"
-  [[ -s "$keyring" ]] || die "Mint keyring did not get created at ${keyring}"
-
-  if ! keyring_contains_keyid "$keyring" "$keyid"; then
-    backup_existing_keyring "$keyring" || true
-    die "Mint keyring created but does not contain expected key (${keyid})."
+  # Preferred: use linuxmint-keyring (installed) OR download its .deb and extract keyring.
+  local src=""
+  if src="$(keyring_from_installed_package 2>/dev/null)"; then
+    info "Using keyring from installed linuxmint-keyring: ${src}"
+    mkdir -p "$(dirname "$out_keyring")"
+    cp -f "$src" "$out_keyring"
+    chmod 644 "$out_keyring"
+    ok "Key installed."
+    return 0
   fi
 
-  ok "Key installed."
+  local tmpdir
+  tmpdir="$(mktemp -d)"
+  chmod 700 "$tmpdir"
+
+  local deb_path=""
+  if deb_path="$(fetch_latest_linuxmint_keyring_deb "$tmpdir")"; then
+    extract_keyring_from_deb_to "$deb_path" "$out_keyring"
+    rm -rf "$tmpdir"
+    ok "Key installed."
+    return 0
+  fi
+
+  rm -rf "$tmpdir"
+  die "Unable to obtain Mint keyring package from ${MINT_MIRROR}. Check proxy/firewall connectivity."
 }
 
-# -------------------------
-# APT sources/pinning
-# -------------------------
-disable_ubuntu_sources_if_present() {
-  if [[ -f /etc/apt/sources.list.d/ubuntu.sources ]]; then
-    local new="/etc/apt/sources.list.d/ubuntu.sources.disabled.ubuntu-to-mint"
-    info "Disabling existing ubuntu.sources to avoid duplicate entries: ${new}"
-    mv -f /etc/apt/sources.list.d/ubuntu.sources "$new" || true
+mint_repo_key_install_system() {
+  info "Installing Linux Mint repo signing key into ${KEYRING_OUT}"
+  mint_repo_key_write_to "$KEYRING_OUT"
+}
+
+###############################################################################
+# Sources + pinning
+###############################################################################
+detect_ubuntu_mirrors() {
+  # Keep it simple and stable; prefer existing mirrors if they look sane.
+  UBUNTU_ARCHIVE_MIRROR="http://archive.ubuntu.com/ubuntu"
+  UBUNTU_SECURITY_MIRROR="http://security.ubuntu.com/ubuntu"
+
+  # If system already uses a mirror, re-use it.
+  local any
+  any="$(grep -RhoE '^deb\s+http[^ ]+\s+' /etc/apt/sources.list /etc/apt/sources.list.d/*.list 2>/dev/null | head -n 1 || true)"
+  if [[ -n "$any" ]]; then
+    local m
+    m="$(echo "$any" | awk '{print $2}')"
+    if [[ "$m" == http*ubuntu.com/ubuntu* || "$m" == http* ]]; then
+      UBUNTU_ARCHIVE_MIRROR="$m"
+    fi
   fi
+  info "Ubuntu archive mirror:  ${UBUNTU_ARCHIVE_MIRROR}"
+  info "Ubuntu security mirror: ${UBUNTU_SECURITY_MIRROR}"
 }
 
 write_mint_sources_system() {
-  local list="/etc/apt/sources.list.d/official-package-repositories.list"
-  local keyring="/usr/share/keyrings/linuxmint-repo.gpg"
-
-  [[ -s "$keyring" ]] || die "Missing keyring ${keyring}. Run key install first."
-
   detect_ubuntu_mirrors
-  disable_ubuntu_sources_if_present
+  info "Writing Mint+Ubuntu sources to ${SOURCES_OUT}"
 
-  info "Writing Mint+Ubuntu sources to ${list}"
-  cat > "$list" <<EOF
+  mkdir -p "$(dirname "$SOURCES_OUT")"
+  cat > "$SOURCES_OUT" <<EOF
 # Do not edit this file manually.
-# Generated by ubuntu-to-mint-convert-v3.sh on $(date -Is)
+# Generated by ${SCRIPT_NAME} on $(date -Is)
 #
 # Linux Mint repository:
-deb [signed-by=${keyring}] ${MINT_MIRROR%/} ${TARGET_MINT} main upstream import backport
+deb [signed-by=${KEYRING_OUT}] ${MINT_MIRROR%/} ${TARGET_MINT} main upstream import backport
 
 # Ubuntu base repositories:
 deb ${UBUNTU_ARCHIVE_MIRROR%/} ${UBUNTU_BASE} main restricted universe multiverse
@@ -590,6 +600,7 @@ deb ${UBUNTU_ARCHIVE_MIRROR%/} ${UBUNTU_BASE}-backports main restricted universe
 deb ${UBUNTU_SECURITY_MIRROR%/} ${UBUNTU_BASE}-security main restricted universe multiverse
 EOF
 
+  # Comment out classic /etc/apt/sources.list (avoid duplicates)
   if [[ -f /etc/apt/sources.list ]]; then
     sed -i 's/^[[:space:]]*deb /# deb /' /etc/apt/sources.list || true
   fi
@@ -598,763 +609,633 @@ EOF
 }
 
 write_mint_pinning_system() {
-  local pref="/etc/apt/preferences.d/50-linuxmint-conversion.pref"
-  info "Writing APT pinning to ${pref}"
-
-  cat > "$pref" <<'EOF'
+  info "Writing conservative APT pinning to ${PIN_OUT}"
+  cat > "$PIN_OUT" <<'EOF'
+# Keep Ubuntu as the default source for overlapping packages.
 Package: *
-Pin: release o=LinuxMint
+Pin: origin "packages.linuxmint.com"
 Pin-Priority: 100
 
-Package: mint* mintsources* mintupdate* mintsystem* mintstick* mintmenu* mintlocale* mintdrivers* mintreport* mintwelcome*
-Pin: release o=LinuxMint
-Pin-Priority: 700
-
-Package: mint* mintsources* mintupdate* mintsystem* mintstick* mintmenu* mintlocale* mintdrivers* mintreport* mintwelcome*
+# Prefer Mint tooling / meta packages.
+Package: mint* mintsources* mintupdate* mintsystem* mintstick* mintmenu* mintlocale* mintdrivers* mintreport* mintwelcome* mintinstall*
 Pin: origin "packages.linuxmint.com"
 Pin-Priority: 700
+EOF
+  ok "Base pinning written."
 
-Package: cinnamon* nemo* muffin* cjs* slick-greeter* lightdm* pix* xviewer* mint-themes* mint-y-icons* mint-x-icons*
-Pin: release o=LinuxMint
-Pin-Priority: 900
-
-Package: cinnamon* nemo* muffin* cjs* slick-greeter* lightdm* pix* xviewer* mint-themes* mint-y-icons* mint-x-icons*
-Pin: origin "packages.linuxmint.com"
-Pin-Priority: 900
-
-Package: python3-xapp* python-xapp* libxapp* gir1.2-xapp* xapps* xapps-common xapp-symbolic-icons xapp-status-icon
-Pin: release o=LinuxMint
-Pin-Priority: 1001
-
-Package: python3-xapp* python-xapp* libxapp* gir1.2-xapp* xapps* xapps-common xapp-symbolic-icons xapp-status-icon
-Pin: origin "packages.linuxmint.com"
-Pin-Priority: 1001
-
-Package: libnemo-extension1* nemo-data*
-Pin: release o=LinuxMint
-Pin-Priority: 1001
-
-Package: libnemo-extension1* nemo-data*
-Pin: origin "packages.linuxmint.com"
-Pin-Priority: 1001
-
-Package: libcinnamon-control-center1* libcinnamon-menu-3-0* libcinnamon-desktop4* cinnamon-desktop-data* cinnamon-control-center-data* cinnamon-l10n*
-Pin: release o=LinuxMint
-Pin-Priority: 1001
-
-Package: libcinnamon-control-center1* libcinnamon-menu-3-0* libcinnamon-desktop4* cinnamon-desktop-data* cinnamon-control-center-data* cinnamon-l10n*
+  info "Writing high-priority desktop stack pinning to ${PIN_STACK_OUT}"
+  cat > "$PIN_STACK_OUT" <<'EOF'
+# Desktop stacks MUST come from Mint repo to avoid Ubuntu/Mint version skew.
+# (This prevents the "not installable" / mixed-version dependency issues.)
+Package: cinnamon* nemo* muffin* cjs* libcjs* libmuffin* libnemo-extension* nemo-* xapp* xapps-* slick-greeter* lightdm* mint-themes* mint-y-icons* mint-x-icons* pix* xviewer* cinnamon-settings-daemon* cinnamon-control-center* cinnamon-session* cinnamon-desktop-data* cinnamon-l10n* libcinnamon* gir1.2-cmenu-3.0 libcinnamon-menu-3-0*
 Pin: origin "packages.linuxmint.com"
 Pin-Priority: 1001
 EOF
-
-  ok "Pinning written."
+  ok "Desktop stack pinning written."
 }
 
-# -------------------------
-# 3rd-party repo handling (preserve Falcon/GlobalProtect/etc)
-# -------------------------
-disable_thirdparty_sources_system() {
-  local backup_dir="$1"
-  local disabled_dir="${backup_dir}/disabled-sources"
-  mkdir -p "$disabled_dir"
-
-  info "Disabling 3rd-party sources into: ${disabled_dir}"
-  shopt -s nullglob
-
-  local allow_re='(crowdstrike|falcon|globalprotect|paloalto|pan(gp)?|cortex|prisma)'
-
-  for f in /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources; do
-    [[ "$(basename "$f")" == "official-package-repositories.list" ]] && continue
-    if echo "$(basename "$f")" | grep -Eiq "$allow_re" || grep -Eiq "$allow_re" "$f"; then
-      info "Preserving vendor repo: $f"
-      continue
-    fi
-    mv -v "$f" "${disabled_dir}/" || true
-  done
-
-  shopt -u nullglob
-  ls -1 "${disabled_dir}" 2>/dev/null | sed 's/^/  disabled: /' | tee -a "${backup_dir}/disabled-sources.txt" >/dev/null || true
-  ok "Third-party sources disabled (restorable via rollback)."
-}
-
-# -------------------------
-# dpkg-divert for known conflicts
-# -------------------------
-apply_known_diversions() {
-  local f="/usr/share/icons/hicolor/16x16/apps/software-properties.png"
-  if dpkg-query -W -f='${Status}' software-properties-gtk 2>/dev/null | grep -q "installed"; then
-    if dpkg -S "$f" 2>/dev/null | grep -q "^software-properties-gtk:"; then
-      info "Applying dpkg-divert for known conflict: $f"
-      dpkg-divert --package ubuntu-to-mint-convert --rename --add "$f" || true
-    fi
+remove_nosnap_pref_if_needed() {
+  if [[ "$PRESERVE_SNAP" == "yes" ]] && [[ -f /etc/apt/preferences.d/nosnap.pref ]]; then
+    warn "Mint 'nosnap' preference detected at /etc/apt/preferences.d/nosnap.pref. Removing to preserve snap functionality."
+    rm -f /etc/apt/preferences.d/nosnap.pref || true
   fi
 }
 
-# -------------------------
-# Backup / snapshot
-# -------------------------
-backup_system_state() {
-  local backup_dir="/root/ubuntu-to-mint-backup-$(date +%Y%m%d-%H%M%S)"
-  mkdir -p "$backup_dir"
-  ON_ERROR_BACKUP_HINT="sudo bash $0 rollback ${backup_dir}"
-
-  info "Creating backup at: ${backup_dir}"
-  mkdir -p "${backup_dir}/etc"
-  cp -a /etc/apt "${backup_dir}/etc/" || true
-  cp -a /etc/os-release /etc/lsb-release 2>/dev/null "${backup_dir}/etc/" || true
-
-  mkdir -p "${backup_dir}/etc/X11" "${backup_dir}/etc/lightdm"
-  cp -a /etc/X11/default-display-manager 2>/dev/null "${backup_dir}/etc/X11/" || true
-  cp -a /etc/lightdm 2>/dev/null "${backup_dir}/etc/" || true
-
-  dpkg-query -W -f='${Package}\t${Version}\n' > "${backup_dir}/dpkg-packages.tsv" || true
-  apt-mark showmanual > "${backup_dir}/apt-manual.txt" || true
-  apt-mark showhold > "${backup_dir}/apt-holds.txt" || true
-  systemctl list-unit-files --state=enabled > "${backup_dir}/enabled-services.txt" || true
-
-  ok "Backup complete."
-  echo "$backup_dir"
-}
-
-timeshift_snapshot_best_effort() {
-  if have_cmd timeshift; then
-    info "Timeshift detected. Attempting pre-change snapshot (best-effort)..."
-    timeshift --create --comments "pre ubuntu->mint $(date -Is)" --tags D || warn "Timeshift snapshot failed (may not be configured)."
-  else
-    warn "Timeshift not installed. Strongly recommended to snapshot/backup before converting."
-  fi
-}
-
-# -------------------------
-# apt-get with tee but correct exit status
-# -------------------------
-run_apt_tee() {
-  local outfile="$1"; shift
-  local old_trap
-  old_trap="$(trap -p ERR || true)"
-  trap - ERR
-  set +e
-
-  DEBIAN_FRONTEND=noninteractive apt-get "$@" 2>&1 | tee "$outfile"
-  local rc="${PIPESTATUS[0]}"
-
-  set -e
-  if [[ -n "$old_trap" ]]; then eval "$old_trap"; else trap 'on_err "$LINENO" "$?"' ERR; fi
-  return "$rc"
-}
-
-parse_and_guard_apt_actions() {
-  local sim_output_file="$1"
-  [[ -r "$sim_output_file" ]] || die "Missing simulation output: $sim_output_file"
-
-  local removed removed_count
-  removed="$(grep -E '^Remv ' "$sim_output_file" | awk '{print $2}' || true)"
-  removed_count="$(echo "$removed" | grep -c . || true)"
-
-  info "APT simulation: packages marked for removal: ${removed_count}"
-
-  local critical_re='^(sudo|openssh-server|ssh|network-manager|systemd|systemd-sysv|dbus|polkit|linux-image|linux-generic|linux-modules|grub|grub2|initramfs-tools|libc6|libstdc\+\+6|snapd|netplan\.io|systemd-resolved)$'
-  local bad=""
-  while IFS= read -r p; do
-    [[ -z "$p" ]] && continue
-    [[ "$p" =~ $critical_re ]] && bad+="$p"$'\n'
-  done <<< "$removed"
-
-  if [[ -n "$bad" ]]; then
-    echo "$bad" | sed 's/^/  - /'
-    die "Refusing to proceed: simulation removes critical packages above."
-  fi
-
-  if [[ "$removed_count" -gt 25 ]]; then
-    die "Refusing to proceed: too many removals (${removed_count}). Inspect conflicts."
-  fi
-
-  ok "Guard rails passed."
-}
-
-# -------------------------
-# Desktop / Display Manager defaults (prefer X11 by default)
-# -------------------------
-find_session_name_for_edition() {
-  local desired="$1"
-  local prefer_wayland="$2"  # yes|no
-  local xs="/usr/share/xsessions"
-  local ws="/usr/share/wayland-sessions"
-
-  [[ -d "$xs" ]] || die "Missing $xs (no X sessions installed?)."
-
-  local sess=""
-
-  if [[ "$prefer_wayland" == "yes" ]]; then
-    local -a way_candidates=()
-    case "$desired" in
-      cinnamon) way_candidates=(cinnamon-wayland) ;;
-      mate)     way_candidates=() ;;
-      xfce)     way_candidates=() ;;
-    esac
-
-    local c
-    for c in "${way_candidates[@]}"; do
-      if [[ -f "$xs/${c}.desktop" ]]; then
-        sess="$c"
-        echo "$sess"
-        return 0
-      fi
-      if [[ -d "$ws" && -f "$ws/${c}.desktop" ]]; then
-        warn "Wayland session '${c}' exists in ${ws}, but LightDM may not support it. Falling back to X11."
-      fi
-    done
-  fi
-
-  local -a candidates=()
-  case "$desired" in
-    cinnamon) candidates=(cinnamon cinnamon2d) ;;
-    mate)     candidates=(mate) ;;
-    xfce)     candidates=(xfce xfce4) ;;
-    *)        candidates=("$desired") ;;
+###############################################################################
+# Packages / simulation / install
+###############################################################################
+edition_meta_pkg() {
+  case "$EDITION" in
+    cinnamon) echo "mint-meta-cinnamon" ;;
+    mate)     echo "mint-meta-mate" ;;
+    xfce)     echo "mint-meta-xfce" ;;
   esac
-
-  local c
-  for c in "${candidates[@]}"; do
-    [[ -f "$xs/${c}.desktop" ]] && sess="$c" && break
-  done
-
-  [[ -n "$sess" ]] || sess="$desired"
-  echo "$sess"
 }
 
-set_mint_defaults_display_manager_and_session() {
-  local dm_pkg="lightdm"
-  local greeter="slick-greeter"
-  local session
-  session="$(find_session_name_for_edition "$EDITION" "$PREFER_WAYLAND")"
+edition_session_name() {
+  case "$EDITION" in
+    cinnamon) echo "cinnamon" ;;
+    mate)     echo "mate" ;;
+    xfce)     echo "xfce" ;;
+  esac
+}
 
-  if [[ "$PREFER_WAYLAND" == "yes" && "$session" != *wayland* ]]; then
-    warn "--prefer-wayland was set, but no LightDM-compatible Wayland session was found; using X11 session '${session}'."
+required_packages_for_convert() {
+  local meta
+  meta="$(edition_meta_pkg)"
+  cat <<EOF
+${meta}
+mint-meta-core
+mint-meta-codecs
+mintsystem
+mintupdate
+mintsources
+mintdrivers
+mintreport
+lightdm
+slick-greeter
+dbus-x11
+x11-common
+xserver-xorg-core
+xserver-xorg-legacy
+EOF
+}
+
+apt_get_opts_common() {
+  local opts=()
+  opts+=("-y")
+  opts+=("-o" "Dpkg::Use-Pty=0")
+  opts+=("-o" "APT::Color=1")
+  opts+=("-o" "Acquire::Retries=3")
+  if [[ "$WITH_RECOMMENDS" == "no" ]]; then
+    opts+=("--no-install-recommends")
+  fi
+  printf '%q ' "${opts[@]}"
+}
+
+apt_simulate_install() {
+  local pkgs=("$@")
+  export DEBIAN_FRONTEND=noninteractive
+
+  info "APT simulation (safety check) of install:"
+  printf '  %s\n' "${pkgs[@]}"
+
+  local sim_out="${LOG_DIR}/plan-$(date +%Y%m%d-%H%M%S).txt"
+  mkdir -p "$LOG_DIR"
+
+  # Capture simulation output
+  apt-get -s $(apt_get_opts_common) install "${pkgs[@]}" | tee "$sim_out" >/dev/null
+
+  # Check removals count
+  local removals
+  removals="$(grep -E '^[[:space:]]*Remv[[:space:]]' "$sim_out" | wc -l | awk '{print $1}')"
+  info "Simulation removals detected: ${removals} (max allowed: ${MAX_ALLOWED_REMOVALS})"
+  if [[ "$removals" -gt "$MAX_ALLOWED_REMOVALS" ]]; then
+    die "APT simulation wants to remove too many packages (${removals}). Aborting. Review: ${sim_out}"
   fi
 
-  info "Staging defaults (apply fully after reboot): DM=${dm_pkg}, greeter=${greeter}, session=${session}"
+  # Critical packages must never be removed
+  local critical=(sudo systemd systemd-sysv network-manager linux-image-generic)
+  for c in "${critical[@]}"; do
+    if grep -E "^[[:space:]]*Remv[[:space:]]+${c}([[:space:]]|:)" "$sim_out" >/dev/null; then
+      die "APT simulation wants to remove critical package '${c}'. Aborting. Review: ${sim_out}"
+    fi
+  done
 
-  DEBIAN_FRONTEND=noninteractive apt-get -y install "${dm_pkg}" "${greeter}"
+  ok "Simulation looks within safety thresholds. Review log: ${sim_out}"
+}
 
-  local dm_path
-  dm_path="$(command -v lightdm 2>/dev/null || true)"
-  [[ -n "$dm_path" ]] || dm_path="/usr/sbin/lightdm"
-  [[ -x "$dm_path" ]] || die "LightDM binary not found/executable at: $dm_path"
+apt_install_mint_stack() {
+  export DEBIAN_FRONTEND=noninteractive
 
-  mkdir -p /etc/X11
-  echo "${dm_path}" > /etc/X11/default-display-manager
+  # Known dpkg overwrite conflict: mintupdate vs software-properties-gtk icon.
+  # We force overwrite ONLY during the conversion install to avoid halting.
+  local dpkg_force_overwrite=(
+    "-o" "Dpkg::Options::=--force-overwrite"
+    "-o" "Dpkg::Options::=--force-confnew"
+  )
 
-  if have_cmd debconf-set-selections; then
-    for owner in gdm3 lightdm sddm; do
-      dpkg-query -W -f='${Status}' "$owner" 2>/dev/null | grep -q "installed" || continue
-      echo "${owner} shared/default-x-display-manager select lightdm" | debconf-set-selections || true
+  local opts=()
+  # shellcheck disable=SC2207
+  opts+=($(apt_get_opts_common))
+  info "Installing Mint stack (with dpkg overwrite guard for known file conflicts)..."
+
+  apt-get "${opts[@]}" install "${dpkg_force_overwrite[@]}" "$@"
+}
+
+###############################################################################
+# Display manager + session defaults
+###############################################################################
+disable_conflicting_lightdm_overrides() {
+  local desired_session
+  desired_session="$(edition_session_name)"
+
+  if [[ -d /etc/lightdm/lightdm.conf.d ]]; then
+    shopt -s nullglob
+    for f in /etc/lightdm/lightdm.conf.d/*.conf; do
+      # Keep our final file
+      [[ "$(basename "$f")" == "99-ubuntu2mint.conf" ]] && continue
+
+      # If a file forces a different user-session, disable it.
+      if grep -Eq '^[[:space:]]*user-session=' "$f"; then
+        local sess
+        sess="$(grep -E '^[[:space:]]*user-session=' "$f" | tail -n1 | cut -d= -f2- | tr -d '[:space:]' || true)"
+        if [[ -n "$sess" && "$sess" != "$desired_session" ]]; then
+          warn "Disabling conflicting LightDM override (forces user-session=${sess}): ${f}"
+          mv -f "$f" "${f}.u2m-disabled" || true
+        fi
+      fi
     done
+    shopt -u nullglob
+  fi
+}
+
+ensure_xsession_desktop_exists() {
+  local sess
+  sess="$(edition_session_name)"
+  case "$sess" in
+    cinnamon)
+      if [[ ! -f /usr/share/xsessions/cinnamon.desktop ]]; then
+        warn "Missing /usr/share/xsessions/cinnamon.desktop; creating a minimal session file."
+        cat > /usr/share/xsessions/cinnamon.desktop <<'EOF'
+[Desktop Entry]
+Name=Cinnamon
+Comment=This session logs you into Cinnamon
+Exec=cinnamon-session-cinnamon
+TryExec=cinnamon-session-cinnamon
+Type=Application
+DesktopNames=X-Cinnamon
+EOF
+      fi
+      ;;
+    mate)
+      # mate.desktop typically provided; we won't fabricate unless missing
+      if ! ls /usr/share/xsessions/*.desktop 2>/dev/null | grep -qi mate; then
+        warn "MATE session desktop file not found under /usr/share/xsessions. Ensure mate-session is installed."
+      fi
+      ;;
+    xfce)
+      # xfce.desktop is typical
+      if ! ls /usr/share/xsessions/*.desktop 2>/dev/null | grep -qi xfce; then
+        warn "XFCE session desktop file not found under /usr/share/xsessions. Ensure xfce4-session is installed."
+      fi
+      ;;
+  esac
+}
+
+set_display_manager_and_session_defaults() {
+  local sess
+  sess="$(edition_session_name)"
+
+  info "Staging defaults: DM=lightdm, greeter=slick-greeter, session=${sess}"
+  export DEBIAN_FRONTEND=noninteractive
+
+  # Force LightDM as default display manager
+  if have_cmd debconf-set-selections; then
     echo "lightdm shared/default-x-display-manager select lightdm" | debconf-set-selections || true
   fi
 
+  # Ensure lightdm + slick-greeter are present (already in stack)
+  apt-get -y install lightdm slick-greeter || true
+
   mkdir -p /etc/lightdm/lightdm.conf.d
-  cat > /etc/lightdm/lightdm.conf.d/60-mint-defaults.conf <<EOF
+
+  disable_conflicting_lightdm_overrides
+
+  cat > /etc/lightdm/lightdm.conf.d/99-ubuntu2mint.conf <<EOF
+# Generated by ${SCRIPT_NAME} on $(date -Is)
 [Seat:*]
-greeter-session=${greeter}
-user-session=${session}
+greeter-session=slick-greeter
+user-session=${sess}
 EOF
 
-  systemctl disable gdm3 2>/dev/null || true
-  systemctl disable sddm 2>/dev/null || true
-  systemctl unmask lightdm.service 2>/dev/null || true
-  systemctl enable lightdm.service 2>/dev/null || systemctl enable lightdm 2>/dev/null || true
+  ensure_xsession_desktop_exists
 
-  ok "Defaults staged: lightdm + ${session}"
+  # LightDM implies X11; make sure we don't end up attempting Wayland sessions.
+  # (No explicit Wayland config is needed, but we also ensure x11-common is sane.)
+  apt-get -y install x11-common dbus-x11 || true
+
+  systemctl enable lightdm >/dev/null 2>&1 || true
+
+  ok "Defaults staged: lightdm + ${sess}"
 }
 
-# -------------------------
-# Post-conversion validation
-# -------------------------
-is_enabled_any() { systemctl is-enabled "$1" >/dev/null 2>&1; }
-is_active_any() { systemctl is-active "$1"  >/dev/null 2>&1; }
+###############################################################################
+# Cinnamon runtime sanity fixes (prevents login loop causes we observed)
+###############################################################################
+purge_conflicting_ubuntu_flavor_packages() {
+  [[ "$PURGE_CONFLICTING_FLAVORS" == "yes" ]] || return 0
 
-detect_first_matching_unit() {
-  local re="$1"
-  systemctl list-unit-files --no-legend 2>/dev/null | awk '{print $1}' | grep -Ei "$re" | head -n1 || true
+  export DEBIAN_FRONTEND=noninteractive
+  local to_purge=()
+
+  # ubuntucinnamon-environment (and friends) has been observed to inject gschema overrides
+  # that don't match Mint Cinnamon, leading to crashes/login loops.
+  if dpkg -l | awk '{print $2}' | grep -q '^ubuntucinnamon-'; then
+    to_purge+=( $(dpkg -l | awk '{print $2}' | grep '^ubuntucinnamon-' || true) )
+  fi
+
+  # Remove ubuntu desktop metapackages only if present and edition is cinnamon,
+  # since they can pull GNOME sessions and change defaults.
+  if [[ "$EDITION" == "cinnamon" ]]; then
+    for p in ubuntu-desktop gdm3; do
+      if dpkg -s "$p" >/dev/null 2>&1; then
+        warn "Detected package '${p}' which may keep GNOME as the default. It will NOT be purged automatically."
+      fi
+    done
+  fi
+
+  if [[ "${#to_purge[@]}" -gt 0 ]]; then
+    warn "Purging conflicting Ubuntu flavor packages: ${to_purge[*]}"
+    apt-get -y purge "${to_purge[@]}" || true
+    apt-get -y autoremove || true
+    ok "Conflicting flavor packages purged (best-effort)."
+  fi
 }
 
-post_convert_validate_or_die() {
-  local backup_dir="$1"
-  local report="${backup_dir}/post-convert-validation.txt"
-  : > "$report"
+fix_cinnamon_symbol_rr_best_effort() {
+  # If csd-* binaries exist, verify they can run (prevents LightDM login loop).
+  # We observed: csd-power/csd-color undefined symbol gnome_rr_screen_new_async
+  # Most often resolved by ensuring gnome-desktop / gnome-rr runtime libs are present and not partially removed.
+  export DEBIAN_FRONTEND=noninteractive
 
-  v() { echo "$*" | tee -a "$report" >/dev/null; }
+  local any="no"
+  [[ -x /usr/bin/csd-power ]] && any="yes"
+  [[ -x /usr/bin/csd-color ]] && any="yes"
+  [[ "$any" == "yes" ]] || return 0
 
-  local failed=0
-  local session
-  session="$(find_session_name_for_edition "$EDITION" "$PREFER_WAYLAND")"
+  info "Validating cinnamon-settings-daemon helpers (csd-power/csd-color) best-effort..."
 
-  info "Running post-conversion validation (report: ${report})"
-
-  v "=== Post-Conversion Validation ==="
-  v "Timestamp: $(date -Is)"
-  v "Edition:   ${EDITION}"
-  v "Session:   ${session}"
-  v "PreferWL:  ${PREFER_WAYLAND}"
-  v "---------------------------------"
-
-  if [[ -f "/usr/share/xsessions/${session}.desktop" ]]; then
-    v "OK: session desktop file exists: /usr/share/xsessions/${session}.desktop"
+  local broken="no"
+  if /usr/bin/csd-power --help >/dev/null 2>&1; then
+    :
   else
-    v "FAIL: missing session desktop file: /usr/share/xsessions/${session}.desktop"
-    failed=1
+    broken="yes"
+  fi
+  if [[ -x /usr/bin/csd-color ]] && ! /usr/bin/csd-color --help >/dev/null 2>&1; then
+    broken="yes"
   fi
 
-  if [[ "$PREFER_WAYLAND" != "yes" && "$session" == *wayland* ]]; then
-    v "WARN: selected session appears to be Wayland despite X11 preference: ${session}"
+  if [[ "$broken" == "no" ]]; then
+    ok "csd-power/csd-color appear runnable."
+    return 0
   fi
 
-  if [[ -r /etc/X11/default-display-manager ]]; then
-    local dm_path
-    dm_path="$(cat /etc/X11/default-display-manager 2>/dev/null || true)"
-    if [[ "$dm_path" =~ lightdm ]] && [[ -x "$dm_path" ]]; then
-      v "OK: default display manager set to: ${dm_path}"
-    else
-      v "FAIL: /etc/X11/default-display-manager is '${dm_path}' (expected executable lightdm path)"
-      failed=1
-    fi
+  warn "csd-* helpers appear broken; attempting library remediation (best-effort)."
+
+  # Ensure core Xsession bits exist (has_option errors typically indicate a broken x11-common installation)
+  apt-get -y install --reinstall x11-common || true
+
+  # Ensure GNOME desktop compatibility libs exist (Noble provides t64 packages)
+  apt-get -y install --reinstall libgnome-desktop-3-20t64 libgnome-desktop-3-common || true
+
+  # libgnome-rr-4 is a distinct runtime in Noble; install if available
+  if apt-cache show libgnome-rr-4-2t64 >/dev/null 2>&1; then
+    apt-get -y install --reinstall libgnome-rr-4-2t64 || true
+  fi
+
+  # Reinstall cinnamon-settings-daemon from Mint repo (pinning should prefer Mint)
+  if dpkg -s cinnamon-settings-daemon >/dev/null 2>&1; then
+    apt-get -y install --reinstall cinnamon-settings-daemon || true
+  fi
+
+  # Re-check
+  if /usr/bin/csd-power --help >/dev/null 2>&1; then
+    ok "csd-power is runnable after remediation."
   else
-    v "FAIL: missing /etc/X11/default-display-manager"
-    failed=1
+    warn "csd-power still appears broken. Cinnamon may login-loop. Check: ldd /usr/bin/csd-power; journalctl -b _UID=\$UID"
   fi
-
-  if is_enabled_any lightdm.service || is_enabled_any lightdm; then
-    v "OK: lightdm is enabled for next boot"
-  else
-    v "FAIL: lightdm is NOT enabled"
-    failed=1
-  fi
-
-  if is_active_any NetworkManager.service || is_active_any network-manager.service; then
-    v "OK: NetworkManager is active"
-  else
-    v "FAIL: NetworkManager is NOT active"
-    failed=1
-  fi
-
-  if apt-get check >/dev/null 2>&1; then
-    v "OK: apt-get check passed"
-  else
-    v "FAIL: apt-get check failed"
-    failed=1
-  fi
-
-  local snapd_installed="no"
-  if dpkg-query -W -f='${Status}' snapd 2>/dev/null | grep -q "installed"; then
-    snapd_installed="yes"
-  fi
-
-  if [[ "$PRESERVE_SNAP" == "yes" && "$snapd_installed" == "yes" ]]; then
-    if is_enabled_any snapd.service || is_enabled_any snapd.socket; then
-      v "OK: snapd is enabled (service or socket)"
-    else
-      v "FAIL: snapd is installed but not enabled (service/socket)"
-      failed=1
-    fi
-  else
-    v "INFO: snapd check skipped (preserve-snap=${PRESERVE_SNAP}, snapd_installed=${snapd_installed})"
-  fi
-
-  local falcon_detect="no"
-  [[ -d /opt/CrowdStrike ]] && falcon_detect="yes"
-  [[ -x /opt/CrowdStrike/falconctl ]] && falcon_detect="yes"
-
-  local falcon_unit
-  falcon_unit="$(detect_first_matching_unit 'falcon(-sensor)?\.service|crowdstrike|falcon')"
-
-  if [[ "$falcon_detect" == "yes" || -n "$falcon_unit" ]]; then
-    v "INFO: CrowdStrike detected (unit=${falcon_unit:-none})"
-    if [[ -n "$falcon_unit" ]]; then
-      if is_enabled_any "$falcon_unit"; then v "OK: ${falcon_unit} is enabled"; else v "FAIL: ${falcon_unit} is NOT enabled"; failed=1; fi
-      if is_active_any "$falcon_unit"; then v "OK: ${falcon_unit} is active"; else v "FAIL: ${falcon_unit} is NOT active"; failed=1; fi
-    else
-      if pgrep -fa 'falcon' >/dev/null 2>&1; then
-        v "OK: CrowdStrike process detected (no unit found, but processes are running)"
-      else
-        v "FAIL: CrowdStrike files detected but no unit found and no falcon process running"
-        failed=1
-      fi
-    fi
-  else
-    v "INFO: CrowdStrike not detected (skipping)"
-  fi
-
-  local gp_detect="no"
-  [[ -d /opt/paloaltonetworks/globalprotect ]] && gp_detect="yes"
-  [[ -x /opt/paloaltonetworks/globalprotect/PanGPS ]] && gp_detect="yes"
-
-  local gp_unit
-  gp_unit="$(detect_first_matching_unit 'gpd\.service|pangps\.service|globalprotect|pan(gp|gps)')"
-
-  if [[ "$gp_detect" == "yes" || -n "$gp_unit" ]]; then
-    v "INFO: GlobalProtect detected (unit=${gp_unit:-none})"
-    if [[ -x /opt/paloaltonetworks/globalprotect/PanGPS ]]; then
-      v "OK: PanGPS binary present"
-    else
-      v "FAIL: PanGPS binary missing at /opt/paloaltonetworks/globalprotect/PanGPS"
-      failed=1
-    fi
-
-    if [[ -n "$gp_unit" ]]; then
-      if is_enabled_any "$gp_unit"; then
-        v "OK: ${gp_unit} is enabled"
-      else
-        v "FAIL: ${gp_unit} is NOT enabled"
-        failed=1
-      fi
-      if is_active_any "$gp_unit"; then
-        v "OK: ${gp_unit} is active"
-      else
-        v "FAIL: ${gp_unit} is NOT active (VPN may fail to connect after reboot)"
-        failed=1
-      fi
-    else
-      if pgrep -x PanGPS >/dev/null 2>&1 || pgrep -x PanGPA >/dev/null 2>&1; then
-        v "OK: GlobalProtect processes detected (no unit found)"
-      else
-        v "WARN: No GlobalProtect unit found and no PanGPS/PanGPA process running (may be normal if not connected)"
-      fi
-    fi
-  else
-    v "INFO: GlobalProtect not detected (skipping)"
-  fi
-
-  if [[ -r /etc/lightdm/lightdm.conf.d/60-mint-defaults.conf ]]; then
-    if grep -q "user-session=${session}" /etc/lightdm/lightdm.conf.d/60-mint-defaults.conf; then
-      v "OK: LightDM default session configured to ${session}"
-    else
-      v "FAIL: LightDM defaults file does not set user-session=${session}"
-      failed=1
-    fi
-    if grep -q "greeter-session=slick-greeter" /etc/lightdm/lightdm.conf.d/60-mint-defaults.conf; then
-      v "OK: LightDM greeter configured to slick-greeter"
-    else
-      v "FAIL: LightDM defaults file does not set greeter-session=slick-greeter"
-      failed=1
-    fi
-  else
-    v "FAIL: missing /etc/lightdm/lightdm.conf.d/60-mint-defaults.conf"
-    failed=1
-  fi
-
-  if [[ "$failed" -ne 0 ]]; then
-    echo
-    echo "${RED}${BOLD}DO NOT REBOOT YET.${NC}"
-    echo "${RED}${BOLD}Post-conversion validation FAILED.${NC}"
-    echo "Report: ${report}"
-    echo "Log:    ${LOG_FILE}"
-    echo
-    echo "Suggested next steps:"
-    echo "  1) Open the report and fix the failing items."
-    echo "  2) If you need to revert APT sources immediately:"
-    echo "       ${ON_ERROR_BACKUP_HINT}"
-    echo
-    exit 12
-  fi
-
-  ok "Post-conversion validation passed."
 }
 
-# -------------------------
-# Plan mode (temp APT env)
-# -------------------------
-apt_simulate_with_temp_sources() {
+###############################################################################
+# Disclaimer gate (convert only)
+###############################################################################
+convert_disclaimer_gate() {
+  [[ "$SUBCMD" == "convert" ]] || return 0
+
+  # Force explicit flag + interactive confirmation (even with --yes).
+  [[ "$RISK_ACK_FLAG" == "yes" ]] || die "convert requires --i-accept-the-risk"
+
+  echo
+  echo "${c_red}${c_bold}======================================================================${c_reset}"
+  echo "${c_red}${c_bold}   UNSUPPORTED MIGRATION METHOD — PROBABLY A REALLY DUMB IDEA${c_reset}"
+  echo "${c_red}${c_bold}======================================================================${c_reset}"
+  echo "${c_red}${c_bold}This script attempts to graft Linux Mint repositories/packages onto Ubuntu.${c_reset}"
+  echo "${c_red}${c_bold}It is NOT supported by Linux Mint, Canonical, your IT department, or your employer.${c_reset}"
+  echo "${c_red}${c_bold}It can break APT, boot/login, device management, VPN/EDR, and leave the system unrecoverable.${c_reset}"
+  echo "${c_red}${c_bold}${c_reset}"
+  echo "${c_red}${c_bold}Recommended approach: do a CLEAN Linux Mint install and restore your data/apps from backup.${c_reset}"
+  echo "${c_red}${c_bold}If this is a corporate-managed device: STOP and get approval first.${c_reset}"
+  echo "${c_red}${c_bold}======================================================================${c_reset}"
+  echo
+
+  echo "To continue anyway, type exactly:"
+  echo "  I UNDERSTAND THIS IS UNSUPPORTED"
+  echo "Anything else will abort."
+  echo
+
+  local answer=""
+  read -r -p "> " answer
+  [[ "$answer" == "I UNDERSTAND THIS IS UNSUPPORTED" ]] || die "Disclaimer not acknowledged. Aborting."
+  ok "Disclaimer acknowledged."
+}
+
+###############################################################################
+# Plan mode (safe simulation using TEMP sources + temp keyring)
+###############################################################################
+plan_mode() {
+  require_root
+  detect_os
+  check_apt_locks
+
+  if [[ "$AUTO_FIX" == "yes" ]]; then
+    apt_fix_basic
+  fi
+
+  info "Plan mode: simulating install with temporary sources/keyring (no APT sources are modified)."
+  ensure_deps_for_keyring
+
   local tmp
   tmp="$(mktemp -d)"
-  trap 'rm -rf "$tmp"' RETURN
+  chmod 700 "$tmp"
+  local tmp_key="${tmp}/linuxmint-repo.gpg"
 
-  mkdir -p "$tmp/etc"
-  cp -a /etc/apt "$tmp/etc/"
-
-  mkdir -p "$tmp/usr/share/keyrings"
-  local temp_keyring="$tmp/usr/share/keyrings/linuxmint-repo.gpg"
-  info "Plan mode: creating temporary Mint keyring at $temp_keyring"
-  mint_repo_key_write_to "$temp_keyring" "no"
+  # Create a temp keyring (never touches system keyring file)
+  info "Preparing temporary Mint keyring for plan mode: ${tmp_key}"
+  OVERWRITE_KEYRING="yes"
+  RECREATE_KEYRING="yes"
+  mint_repo_key_write_to "$tmp_key"
 
   detect_ubuntu_mirrors
-
-  cat > "$tmp/etc/apt/sources.list" <<EOF
-deb [signed-by=${temp_keyring}] ${MINT_MIRROR%/} ${TARGET_MINT} main upstream import backport
+  local tmp_sources="${tmp}/sources.list"
+  cat > "$tmp_sources" <<EOF
+deb [signed-by=${tmp_key}] ${MINT_MIRROR%/} ${TARGET_MINT} main upstream import backport
 deb ${UBUNTU_ARCHIVE_MIRROR%/} ${UBUNTU_BASE} main restricted universe multiverse
 deb ${UBUNTU_ARCHIVE_MIRROR%/} ${UBUNTU_BASE}-updates main restricted universe multiverse
 deb ${UBUNTU_ARCHIVE_MIRROR%/} ${UBUNTU_BASE}-backports main restricted universe multiverse
 deb ${UBUNTU_SECURITY_MIRROR%/} ${UBUNTU_BASE}-security main restricted universe multiverse
 EOF
 
-  mkdir -p "$tmp/etc/apt/preferences.d"
-  cat > "$tmp/etc/apt/preferences.d/50-linuxmint-conversion.pref" <<'EOF'
+  mkdir -p "${tmp}/lists" "${tmp}/cache" "${tmp}/prefs.d"
+  cp -a /etc/apt/preferences.d/*.pref "${tmp}/prefs.d/" 2>/dev/null || true
+
+  # Add our pinning into temp prefs
+  cat > "${tmp}/prefs.d/50-linuxmint-conversion.pref" <<'EOF'
 Package: *
-Pin: release o=LinuxMint
+Pin: origin "packages.linuxmint.com"
 Pin-Priority: 100
 
-Package: mint* mintsources* mintupdate* mintsystem* mintstick* mintmenu* mintlocale* mintdrivers* mintreport* mintwelcome*
-Pin: release o=LinuxMint
-Pin-Priority: 700
-
-Package: mint* mintsources* mintupdate* mintsystem* mintstick* mintmenu* mintlocale* mintdrivers* mintreport* mintwelcome*
+Package: mint* mintsources* mintupdate* mintsystem* mintstick* mintmenu* mintlocale* mintdrivers* mintreport* mintwelcome* mintinstall*
 Pin: origin "packages.linuxmint.com"
 Pin-Priority: 700
-
-Package: cinnamon* nemo* muffin* cjs* slick-greeter* lightdm* pix* xviewer* mint-themes* mint-y-icons* mint-x-icons*
-Pin: release o=LinuxMint
-Pin-Priority: 900
-
-Package: cinnamon* nemo* muffin* cjs* slick-greeter* lightdm* pix* xviewer* mint-themes* mint-y-icons* mint-x-icons*
-Pin: origin "packages.linuxmint.com"
-Pin-Priority: 900
-
-Package: python3-xapp* python-xapp* libxapp* gir1.2-xapp* xapps* xapps-common xapp-symbolic-icons xapp-status-icon
-Pin: release o=LinuxMint
-Pin-Priority: 1001
-
-Package: python3-xapp* python-xapp* libxapp* gir1.2-xapp* xapps* xapps-common xapp-symbolic-icons xapp-status-icon
-Pin: origin "packages.linuxmint.com"
-Pin-Priority: 1001
-
-Package: libnemo-extension1* nemo-data*
-Pin: release o=LinuxMint
-Pin-Priority: 1001
-
-Package: libnemo-extension1* nemo-data*
-Pin: origin "packages.linuxmint.com"
-Pin-Priority: 1001
-
-Package: libcinnamon-control-center1* libcinnamon-menu-3-0* libcinnamon-desktop4* cinnamon-desktop-data* cinnamon-control-center-data* cinnamon-l10n*
-Pin: release o=LinuxMint
-Pin-Priority: 1001
-
-Package: libcinnamon-control-center1* libcinnamon-menu-3-0* libcinnamon-desktop4* cinnamon-desktop-data* cinnamon-control-center-data* cinnamon-l10n*
+EOF
+  cat > "${tmp}/prefs.d/51-linuxmint-desktop-stack.pref" <<'EOF'
+Package: cinnamon* nemo* muffin* cjs* libcjs* libmuffin* libnemo-extension* nemo-* xapp* xapps-* slick-greeter* lightdm* mint-themes* mint-y-icons* mint-x-icons* pix* xviewer* cinnamon-settings-daemon* cinnamon-control-center* cinnamon-session* cinnamon-desktop-data* cinnamon-l10n* libcinnamon* gir1.2-cmenu-3.0 libcinnamon-menu-3-0*
 Pin: origin "packages.linuxmint.com"
 Pin-Priority: 1001
 EOF
 
-  mkdir -p "$tmp/var/lib/apt/lists/partial" "$tmp/var/cache/apt/archives/partial"
+  local pkgs
+  mapfile -t pkgs < <(required_packages_for_convert)
 
-  local recommends="--no-install-recommends"
-  [[ "$WITH_RECOMMENDS" == "yes" ]] && recommends=""
+  info "Running plan simulation..."
+  export DEBIAN_FRONTEND=noninteractive
 
-  local -a pkgs=()
-  case "$EDITION" in
-    cinnamon) pkgs+=(mint-meta-cinnamon) ;;
-    mate)     pkgs+=(mint-meta-mate) ;;
-    xfce)     pkgs+=(mint-meta-xfce) ;;
-  esac
-  pkgs+=(mint-meta-core mint-meta-codecs mintsystem mintupdate mintsources)
+  # We must point apt at temp source list + temp lists/cache, but use real dpkg status.
+  apt-get \
+    -o "Dir::Etc::sourcelist=${tmp_sources}" \
+    -o "Dir::Etc::sourceparts=-" \
+    -o "Dir::Etc::PreferencesParts=${tmp}/prefs.d" \
+    -o "Dir::State::Lists=${tmp}/lists" \
+    -o "Dir::Cache=${tmp}/cache" \
+    -o "Dir::State::status=/var/lib/dpkg/status" \
+    -y update
 
-  info "Plan mode: apt update (temporary dirs)..."
-  DEBIAN_FRONTEND=noninteractive apt-get \
-    -o Dir::Etc="$tmp/etc/apt" \
-    -o Dir::Etc::sourceparts="-" \
-    -o Dir::State="$tmp/var/lib/apt" \
-    -o Dir::Cache="$tmp/var/cache/apt" \
-    -o Dir::State::status="/var/lib/dpkg/status" \
-    -o Acquire::Retries=3 \
-    update
+  # Simulation install
+  apt-get \
+    -o "Dir::Etc::sourcelist=${tmp_sources}" \
+    -o "Dir::Etc::sourceparts=-" \
+    -o "Dir::Etc::PreferencesParts=${tmp}/prefs.d" \
+    -o "Dir::State::Lists=${tmp}/lists" \
+    -o "Dir::Cache=${tmp}/cache" \
+    -o "Dir::State::status=/var/lib/dpkg/status" \
+    -s $(apt_get_opts_common) install "${pkgs[@]}" \
+    | tee "${LOG_DIR}/plan-$(date +%Y%m%d-%H%M%S).txt" >/dev/null
 
-  local plan_log="$LOG_DIR/plan-$(date +%Y%m%d-%H%M%S).txt"
-  info "Plan mode: simulated install: ${pkgs[*]}"
-  if ! run_apt_tee "$plan_log" \
-      -o Dir::Etc="$tmp/etc/apt" \
-      -o Dir::Etc::sourceparts="-" \
-      -o Dir::State="$tmp/var/lib/apt" \
-      -o Dir::Cache="$tmp/var/cache/apt" \
-      -o Dir::State::status="/var/lib/dpkg/status" \
-      -o Acquire::Retries=3 \
-      -s install $recommends "${pkgs[@]}"; then
-    tail -n 160 "$plan_log" >&2 || true
-    die "Plan simulation failed. See: $plan_log"
-  fi
-
-  ok "Plan completed. Review: $plan_log"
+  ok "Plan mode complete. Temp dir preserved for review: ${tmp}"
 }
 
-# -------------------------
-# Convert mode
-# -------------------------
-convert_apply() {
-  [[ "$ACCEPT_RISK" == "yes" ]] || die "You must pass --i-accept-the-risk to run convert."
+###############################################################################
+# Post-conversion validation (writes report file reliably)
+###############################################################################
+post_convert_validation() {
+  local report="$1"
+  : > "$report" || die "Unable to write report file: $report"
 
-  require_unsupported_disclaimer
-  preflight_common "yes"
-
-  if [[ "$ASSUME_YES" != "yes" ]]; then
+  local fail="no"
+  {
+    echo "Post-convert validation report: $(date -Is)"
+    echo "Edition: ${EDITION}"
+    echo "Ubuntu base: ${UBUNTU_BASE} | Mint target: ${TARGET_MINT}"
     echo
-    warn "This can break a corporate-managed machine. Ensure you have approval + a rollback plan."
-    echo "Target: Ubuntu ${UBUNTU_BASE} -> Mint ${TARGET_MINT} (${EDITION})"
-    read -r -p "Type 'I UNDERSTAND' to continue: " ans
-    [[ "$ans" == "I UNDERSTAND" ]] || die "Aborted by user."
+    echo "Keyring: ${KEYRING_OUT}"
+    if [[ -r "$KEYRING_OUT" ]] && gpg --batch --quiet --show-keys "$KEYRING_OUT" >/dev/null 2>&1; then
+      echo "  OK: keyring readable"
+    else
+      echo "  FAIL: keyring missing or unreadable"
+      fail="yes"
+    fi
+
+    echo
+    echo "Sources: ${SOURCES_OUT}"
+    if [[ -r "$SOURCES_OUT" ]] && grep -q "packages.linuxmint.com" "$SOURCES_OUT"; then
+      echo "  OK: sources file present"
+    else
+      echo "  FAIL: sources file missing or does not reference Mint"
+      fail="yes"
+    fi
+
+    echo
+    echo "APT health:"
+    if apt-get -s check >/dev/null 2>&1; then
+      echo "  OK: apt-get check"
+    else
+      echo "  WARN: apt-get check reports issues"
+      fail="yes"
+    fi
+
+    echo
+    echo "Display manager:"
+    if systemctl is-enabled lightdm >/dev/null 2>&1; then
+      echo "  OK: lightdm enabled"
+    else
+      echo "  WARN: lightdm not enabled"
+      fail="yes"
+    fi
+
+    echo
+    echo "Sessions present:"
+    ls -1 /usr/share/xsessions 2>/dev/null | egrep -i 'cinnamon|mate|xfce|ubuntu|gnome' || true
+
+    echo
+    echo "Cinnamon helper sanity (if installed):"
+    if [[ -x /usr/bin/csd-power ]]; then
+      if /usr/bin/csd-power --help >/dev/null 2>&1; then
+        echo "  OK: csd-power runnable"
+      else
+        echo "  FAIL: csd-power not runnable (may cause login loop)"
+        echo "  Hint: ldd /usr/bin/csd-power ; journalctl -b _UID=\$UID"
+        fail="yes"
+      fi
+    else
+      echo "  NOTE: csd-power not found"
+    fi
+
+    echo
+    echo "LightDM config:"
+    grep -R --line-number -E 'user-session=|greeter-session=' /etc/lightdm 2>/dev/null || true
+  } >> "$report"
+
+  [[ "$fail" == "no" ]]
+}
+
+###############################################################################
+# Convert mode (main)
+###############################################################################
+convert_mode() {
+  require_root
+  detect_os
+  check_apt_locks
+  convert_disclaimer_gate
+
+  setup_logging
+
+  if [[ "$AUTO_FIX" == "yes" ]]; then
+    apt_fix_basic
   fi
 
-  local backup_dir
-  backup_dir="$(backup_system_state)"
+  # Backup first (single, stable)
+  BACKUP_DIR="$(backup_system_state)"
+  ON_ERROR_BACKUP_HINT="sudo bash ${SCRIPT_NAME} rollback ${BACKUP_DIR}"
+
   timeshift_snapshot_best_effort
 
-  local held
-  held="$(apt-mark showhold || true)"
-  if [[ -n "$held" ]]; then
-    warn "Held packages detected:"
-    echo "$held" | sed 's/^/  HOLD: /'
-    if [[ "$ALLOW_UNHOLD" == "yes" ]]; then
-      info "Saving holds list to ${backup_dir}/held-packages.txt and temporarily unholding..."
-      echo "$held" > "${backup_dir}/held-packages.txt"
-      # shellcheck disable=SC2086
-      apt-mark unhold $held
-    else
-      die "Held packages will block dependency resolution. Resolve holds or re-run with --allow-unhold."
-    fi
-  fi
-
-  DEBIAN_FRONTEND=noninteractive apt-get -y install debconf-utils || true
-  if have_cmd debconf-set-selections; then
-    echo "lightdm shared/default-x-display-manager select lightdm" | debconf-set-selections || true
-  fi
-
-  systemctl stop apt-daily.service apt-daily-upgrade.service 2>/dev/null || true
-  systemctl kill --kill-who=all apt-daily.service apt-daily-upgrade.service 2>/dev/null || true
-
   if [[ "$KEEP_PPAS" != "yes" ]]; then
-    disable_thirdparty_sources_system "$backup_dir"
+    disable_thirdparty_sources_system "$BACKUP_DIR"
   else
-    warn "--keep-ppas set. Proceeding with third-party sources enabled may increase conflict risk."
+    warn "--keep-ppas enabled; leaving third-party sources intact (riskier)."
   fi
 
-  mint_repo_key_install
+  # Keyring + sources + pinning
+  mint_repo_key_install_system
   write_mint_sources_system
   write_mint_pinning_system
+  remove_nosnap_pref_if_needed
 
-  info "APT update..."
-  DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::Retries=3 update
-
-  if ! apt-cache show mint-meta-core >/dev/null 2>&1; then
-    die "Mint repo not usable: apt cannot see 'mint-meta-core'. Check mirror/key/network."
-  fi
-
-  local recommends="--no-install-recommends"
-  [[ "$WITH_RECOMMENDS" == "yes" ]] && recommends=""
-
-  local -a pkgs=()
-  case "$EDITION" in
-    cinnamon) pkgs+=(mint-meta-cinnamon) ;;
-    mate)     pkgs+=(mint-meta-mate) ;;
-    xfce)     pkgs+=(mint-meta-xfce) ;;
-  esac
-  pkgs+=(mint-meta-core mintsystem mintupdate mintsources mint-meta-codecs)
-
-  info "Simulation (safety check) of install: ${pkgs[*]}"
-  local sim_out="${backup_dir}/apt-sim-install.txt"
-  if ! run_apt_tee "$sim_out" -s install $recommends "${pkgs[@]}"; then
-    tail -n 200 "$sim_out" >&2 || true
-    die "APT simulation failed. See: $sim_out"
-  fi
-  parse_and_guard_apt_actions "$sim_out"
-
-  apply_known_diversions
-
-  info "Installing Mint packages..."
   export DEBIAN_FRONTEND=noninteractive
-  export NEEDRESTART_MODE=a
+  info "APT update..."
+  apt-get -y update
 
-  if ! apt-get -y install \
-      -o Dpkg::Options::=--force-overwrite \
-      -o Dpkg::Options::=--force-confdef \
-      -o Dpkg::Options::=--force-confold \
-      $recommends \
-      "${pkgs[@]}"; then
-    warn "Initial install hit errors; attempting fix-broken with overwrite smoothing..."
-    apt_fix_broken_overwrite
-    apt-get -y install \
-      -o Dpkg::Options::=--force-overwrite \
-      -o Dpkg::Options::=--force-confdef \
-      -o Dpkg::Options::=--force-confold \
-      $recommends \
-      "${pkgs[@]}"
+  # Purge known conflicting Ubuntu flavor bits (especially ubuntucinnamon-environment)
+  purge_conflicting_ubuntu_flavor_packages
+
+  # Determine packages and run simulation first
+  local pkgs
+  mapfile -t pkgs < <(required_packages_for_convert)
+  apt_simulate_install "${pkgs[@]}"
+
+  # Install
+  apt_install_mint_stack "${pkgs[@]}"
+
+  # Re-run apt fix
+  apt-get -y -f install || true
+  apt-get -y --fix-broken install || true
+
+  # Stage DM + session defaults
+  set_display_manager_and_session_defaults
+
+  # Best-effort fix for the csd-power/csd-color symbol issue + Xsession "has_option" breakage
+  fix_cinnamon_symbol_rr_best_effort
+
+  # Write post-convert report into backup dir
+  local report="${BACKUP_DIR}/post-convert-validation.txt"
+  info "Running post-conversion validation (report: ${report})"
+  if post_convert_validation "$report"; then
+    ok "Post-conversion validation PASSED."
+    echo
+    ok "Conversion complete."
+    info "Reboot recommended."
+    info "If you need rollback: sudo bash ${SCRIPT_NAME} rollback ${BACKUP_DIR}"
+  else
+    echo
+    echo "${c_red}${c_bold}DO NOT REBOOT YET.${c_reset}"
+    echo "${c_red}${c_bold}Post-conversion validation FAILED.${c_reset}"
+    echo "Report: ${report}"
+    echo "Log:    ${LOG_FILE}"
+    echo
+    echo "Suggested next steps:"
+    echo "  1) Open the report and fix the failing items."
+    echo "  2) If you need to revert APT sources immediately:"
+    echo "       sudo bash ${SCRIPT_NAME} rollback ${BACKUP_DIR}"
+    exit 2
   fi
-
-  if [[ "$PRESERVE_SNAP" == "yes" ]]; then
-    local nosnap="/etc/apt/preferences.d/nosnap.pref"
-    if [[ -f "$nosnap" ]]; then
-      warn "Mint 'nosnap' preference detected at ${nosnap}. Removing to preserve snap functionality."
-      rm -f "$nosnap"
-      DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::Retries=3 update
-    fi
-  fi
-
-  set_mint_defaults_display_manager_and_session
-
-  if [[ -f "${backup_dir}/held-packages.txt" ]]; then
-    info "Re-applying package holds from ${backup_dir}/held-packages.txt"
-    # shellcheck disable=SC2046
-    apt-mark hold $(cat "${backup_dir}/held-packages.txt") || true
-  fi
-
-  post_convert_validate_or_die "$backup_dir"
-
-  ok "Conversion completed successfully."
-  info "Backup dir: ${backup_dir}"
-  info "Log file:   ${LOG_FILE}"
-  echo
-  echo "Next steps:"
-  echo "  1) Reboot (required for display manager/session defaults to fully apply)."
-  echo "  2) Validate corp software end-to-end: VPN, EDR, SSO, printers, etc."
 }
 
-# -------------------------
-# Rollback mode: restore /etc/apt from backup (does NOT remove installed packages)
-# -------------------------
-rollback_apply() {
-  need_root
-  local backup_dir="$1"
-  [[ -n "$backup_dir" ]] || die "rollback requires a backup dir argument."
-  [[ -d "$backup_dir" ]] || die "No such backup dir: $backup_dir"
-  [[ -d "${backup_dir}/etc/apt" ]] || die "Backup dir missing etc/apt: $backup_dir"
-
-  if [[ "$backup_dir" != /root/ubuntu-to-mint-backup-* ]]; then
-    warn "Backup dir does not match expected pattern /root/ubuntu-to-mint-backup-*. Proceeding anyway."
-  fi
-
-  info "Restoring /etc/apt from backup: ${backup_dir}/etc/apt"
-  if [[ -d /etc/apt ]]; then
-    mv /etc/apt "/etc/apt.pre-rollback.$(date +%Y%m%d-%H%M%S)" || true
-  fi
-  cp -a "${backup_dir}/etc/apt" /etc/apt
-
-  if [[ -d "${backup_dir}/disabled-sources" ]]; then
-    info "Restoring disabled sources from ${backup_dir}/disabled-sources"
-    mkdir -p /etc/apt/sources.list.d
-    cp -a "${backup_dir}/disabled-sources/." /etc/apt/sources.list.d/ || true
-  fi
-
-  info "APT update after rollback..."
-  DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::Retries=3 update || true
-  ok "Rollback of APT configuration completed."
-  info "Note: This does NOT automatically remove Mint-installed packages. Use Timeshift/snapshot to fully revert system state."
-}
-
+###############################################################################
+# Main
+###############################################################################
 main() {
-  case "$MODE" in
+  case "$SUBCMD" in
     doctor)
-      preflight_common "$AUTO_FIX"
-      ok "Doctor completed."
+      require_root
+      setup_logging
+      parse_args "$@"
+      detect_os
+      check_apt_locks
+      [[ "$AUTO_FIX" == "yes" ]] && apt_fix_basic
+      doctor_report
       ;;
     plan)
-      preflight_common "$AUTO_FIX"
-      apt_simulate_with_temp_sources
+      setup_logging
+      parse_args "$@"
+      plan_mode
       ;;
     convert)
-      convert_apply
+      parse_args "$@"
+      convert_mode
       ;;
     rollback)
-      rollback_apply "$ROLLBACK_DIR"
+      require_root
+      setup_logging
+      [[ $# -ge 1 ]] || die "rollback requires a backup directory path."
+      rollback_from_backup "$1"
+      ;;
+    ""|help|-h|--help)
+      usage
       ;;
     *)
       usage
-      exit 1
+      die "Unknown subcommand: ${SUBCMD}"
       ;;
   esac
 }
