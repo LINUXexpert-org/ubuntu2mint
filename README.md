@@ -1,42 +1,39 @@
-# ubuntu-to-mint-convert-v3
+# ubuntu2mint / ubuntu-to-mint-convert-v3
 
-High-risk, best-effort **in-place conversion** script that keeps **Ubuntu as the base OS** while adding **Linux Mint repositories + Mint desktop/tooling** to approximate a Linux Mint system without a full reinstall.
+High-risk, best-effort **in-place conversion** script that keeps **Ubuntu as the base OS** while adding **Linux Mint repositories + Mint desktop/tooling** to approximate a Linux Mint system **without a full reinstall**.
 
 This project is intended for experienced Linux admins who understand APT, repo pinning, display managers, and rollback strategies.
 
-> ⚠️ **Warning (Read This First)**  
+> 🟥 **UNSUPPORTED + PROBABLY DUMB (READ THIS FIRST)**  
 > There is **no guaranteed safe** way to convert Ubuntu to Linux Mint in-place and preserve *all* corporate software/agents.  
-> EDR/MDM/VPN/compliance tooling may break and require re-enrollment. Use this only if you accept that risk.
-
-
-
-## What changed in the latest script (v4.3)
-
-- **Convert-only “unsupported migration” disclaimer gate** (requires typing: `I UNDERSTAND THIS IS UNSUPPORTED`)
-- Defaults to **LightDM + slick-greeter** and explicitly sets the **default desktop session**
-- **X11 is the default session preference** (safer for conversions/corporate tooling)
-- Added `--prefer-wayland` (best-effort only; may fall back to X11 with a warning)
-- Improved Mint repo key handling:
-  - `--overwrite-keyring` / `--recreate-keyring`
-  - automatic detection/repair if the keyring exists but doesn’t contain the expected key
-  - HKPS → HKP:80 → HTTPS fallback, with **atomic keyring writes**
-- Improved plan mode: uses a temporary APT environment (no changes to system APT files)
+> **EDR/MDM/VPN/compliance tooling may break** and require re-enrollment.  
+> A **clean install** (or a second disk/VM test) is the recommended approach.  
+>  
+> The script enforces an interactive “I understand” gate during `convert` and also requires `--i-accept-the-risk`.
 
 
 
 ## What this does
 
 - Detects supported Ubuntu bases:
-  - **Ubuntu 24.04 (noble)** → targets **Linux Mint 22.x** (default target: **zena**)
-  - **Ubuntu 22.04 (jammy)** → targets **Linux Mint 21.x** (default target: **virginia**)
+  - **Ubuntu 24.04 (noble)** → targets **Linux Mint 22.x** (default **22.3 “zena”**)
+  - **Ubuntu 22.04 (jammy)** → targets **Linux Mint 21.x** (default **21.3 “virginia”**)
 - Adds the Linux Mint package repository (`packages.linuxmint.com`)
 - Keeps Ubuntu repos for the underlying base system
-- Installs Mint meta-packages (desktop + tooling)
-- Applies conservative APT pinning so Ubuntu remains the default for overlapping packages
-- Includes safety checks, dry-run planning, and rollback support
-- Sets **display manager + greeter + default session** based on `--edition`
-
-
+- Installs Mint meta-packages (desktop + tooling) and configures:
+  - **LightDM** as default display manager
+  - **slick-greeter** as greeter
+  - Default desktop session based on `--edition`
+- Applies conservative APT pinning:
+  - Ubuntu remains default for overlapping base packages
+  - Mint desktop stack is pinned high to avoid mixed-version dependency breakage
+- Includes guardrails:
+  - APT/dpkg lock detection
+  - best-effort dpkg/apt repair (`--no-auto-fix` to disable)
+  - simulation plan + safety checks (removal thresholds + critical package protection)
+  - disables third-party sources by default (with allowlist heuristics for common corp repos)
+  - backup + rollback support
+  - post-conversion validation report written into the backup directory
 
 ## What this does *not* do
 
@@ -44,7 +41,7 @@ This project is intended for experienced Linux admins who understand APT, repo p
 - It does **not** guarantee your machine remains compliant in managed enterprise environments.
 - It does **not** guarantee perfect package resolution—APT may still want to remove packages.
 - Rollback restores `/etc/apt`, but may not remove packages installed during conversion (use snapshots/Timeshift for full reversion).
-- `--prefer-wayland` is **best-effort** and may fall back to X11 depending on what sessions are available and LightDM compatibility.
+- This script is **LightDM-first**, which implies **X11 sessions**; it does not attempt to force Wayland.
 
 
 
@@ -52,11 +49,10 @@ This project is intended for experienced Linux admins who understand APT, repo p
 
 - Ubuntu **24.04 (noble)** or **22.04 (jammy)**
 - Root access (`sudo`)
-- Working APT and dpkg state (the script attempts basic remediation)
+- Working APT and dpkg state (the script can attempt basic remediation)
 - Internet access to:
   - Ubuntu mirrors (or your corporate mirror)
   - `packages.linuxmint.com`
-  - key retrieval endpoints (HKPS/HKP/HTTPS fallbacks)
 - Recommended:
   - **Timeshift** snapshot configured
   - Full-disk backup or VM snapshot
@@ -81,11 +77,10 @@ Plan mode simulates the APT changes and writes a log under `/var/log/ubuntu-to-m
 sudo bash ubuntu-to-mint-convert-v3.sh plan --edition cinnamon
 ```
 
-Plan mode simulates APT changes using a **temporary APT environment** (it does not modify your system’s APT sources).
-It will fetch the Linux Mint repository signing key into a **temporary keyring** for the simulation.
+Plan mode uses a **temporary APT environment** (it does not modify your system’s APT sources).
+It creates a **temporary Mint keyring** by downloading and extracting the `linuxmint-keyring` package.
 
-> Note: If `curl`/`gnupg`/`dirmngr` are missing, plan mode may require installing prerequisites if you run with `--auto-fix`.
-> No repository files on your system are changed by plan mode.
+> Plan mode is for decision support. It does not modify `/etc/apt` or install Mint repos onto your live system.
 
 ### 3) Run conversion
 
@@ -93,36 +88,36 @@ It will fetch the Linux Mint repository signing key into a **temporary keyring**
 sudo bash ubuntu-to-mint-convert-v3.sh convert --i-accept-the-risk --edition cinnamon
 ```
 
-You can skip the secondary confirmation prompt with `--yes`:
+You can skip the secondary interactive confirmation prompts with `--yes`:
 
 ```bash
 sudo bash ubuntu-to-mint-convert-v3.sh convert --i-accept-the-risk --edition cinnamon --yes
 ```
 
-> The **big red unsupported disclaimer** is still required during `convert` even if `--yes` is set.
+> The big red unsupported disclaimer gate is still required during `convert` even with `--yes`.
 
 ### 4) Reboot and validate
 
 After conversion:
 
 1. Reboot
-2. Login via LightDM (slyck-greeter) and confirm your default session loads
+2. Login via LightDM and confirm your chosen session loads
 3. Validate:
 
    * VPN connectivity (GlobalProtect, etc.)
    * EDR/MDM agents + compliance posture (CrowdStrike Falcon, etc.)
-   * Corporate certificates / SSO
+   * corporate certificates / SSO
    * NetworkManager
-   * Printers
-   * Smartcards / YubiKey
-   * Cameras/audio
+   * printers
+   * smartcards / YubiKey
+   * camera/audio
 
 
 
 ## Usage
 
 ```text
-sudo bash ubuntu-to-mint-convert-v3.sh doctor [--auto-fix]
+sudo bash ubuntu-to-mint-convert-v3.sh doctor [--no-auto-fix]
 sudo bash ubuntu-to-mint-convert-v3.sh plan [options]
 sudo bash ubuntu-to-mint-convert-v3.sh convert --i-accept-the-risk [options]
 sudo bash ubuntu-to-mint-convert-v3.sh rollback /root/ubuntu-to-mint-backup-YYYYMMDD-HHMMSS
@@ -132,7 +127,7 @@ sudo bash ubuntu-to-mint-convert-v3.sh rollback /root/ubuntu-to-mint-backup-YYYY
 
 ## Options
 
-### Core
+### Desktop / targets
 
 * `--edition cinnamon|mate|xfce`
   Desktop edition meta-package to install (default: `cinnamon`).
@@ -144,65 +139,57 @@ sudo bash ubuntu-to-mint-convert-v3.sh rollback /root/ubuntu-to-mint-backup-YYYY
   * Ubuntu `jammy`: `virginia`, `victoria`, `vera`, `vanessa`
 
 * `--mint-mirror <url>`
-  Override Mint mirror base URL (default: `http://packages.linuxmint.com`).
+  Override Mint mirror base URL (default: `http://packages.linuxmint.com`)
 
 ### Safety / APT behavior
 
 * `--keep-ppas`
   Do not disable third-party APT sources (not recommended).
-
-* `--allow-unhold`
-  Temporarily unhold held packages during conversion (risky; holds are re-applied later).
+  **Default behavior** disables PPAs and most third-party repos during conversion and moves them into the backup folder.
+  Some common enterprise repos may be automatically allowlisted.
 
 * `--with-recommends`
   Allow installation of recommended packages (default: off for safety).
 
-* `--auto-fix`
-  For `doctor`/`plan`: allow basic dpkg/apt remediation and install missing tool prerequisites.
+* `--max-removals N`
+  Abort if APT simulation removes more than N packages (default: `40`).
 
 * `--yes`
-  Skip the secondary interactive confirmation prompt inside convert (does **not** bypass the main disclaimer gate).
+  Skip most interactive prompts.
+  (Does **not** bypass the `convert` disclaimer gate or `--i-accept-the-risk` requirement.)
 
-### Snap handling
-
-* `--preserve-snap` (default)
-  Keep Snap working even if Mint preferences attempt to disable it.
-
-* `--no-preserve-snap`
-  Do not try to preserve Snap behavior.
+* `--no-auto-fix`
+  Disable best-effort dpkg/apt repair pre-flight.
 
 ### Keyring handling
 
 * `--overwrite-keyring`
-  Overwrite the Mint repo keyring if it exists.
+  If `/usr/share/keyrings/linuxmint-repo.gpg` exists, overwrite it.
 
 * `--recreate-keyring`
-  Back up the existing keyring and recreate it from scratch.
+  Back up and delete the keyring then recreate it.
 
-### Wayland / X11 behavior
+### Flavor / meta package conflict handling
 
-* (default) **Prefers X11 session**
-  Safer for conversions and enterprise desktop tooling.
-
-* `--prefer-wayland`
-  Best-effort attempt to prefer Wayland if it is **LightDM-compatible** (otherwise warns and falls back to X11).
+* `--no-purge-flavor`
+  Disable best-effort purging of conflicting Ubuntu flavor packages (e.g., `ubuntucinnamon-*`) that can cause session crashes/login loops.
 
 
 
 ## Safety model (important)
 
-The script includes guardrails to reduce “brick your system” outcomes:
+Guardrails included to reduce “brick your system” outcomes:
 
 * Refuses to run unless on supported Ubuntu bases
 * Detects and blocks active APT/dpkg locks
-* Attempts to repair basic dpkg/apt broken states
-* Disables PPAs by default during conversion (while attempting to preserve vendor repos for Falcon/GlobalProtect when identifiable)
+* Attempts to repair basic dpkg/apt broken states (unless `--no-auto-fix`)
+* Disables PPAs by default during conversion (unless `--keep-ppas`)
 * Runs an APT simulation and aborts if:
 
-  * APT wants to remove critical packages (e.g., `sudo`, `systemd`, `network-manager`, kernel packages, `snapd`)
-  * too many removals are detected
-* Writes detailed logs and creates a backup folder for rollback
-* Validates post-conversion basics (LightDM default, session file, NetworkManager, apt health, and best-effort checks for Falcon/GlobalProtect presence)
+  * APT wants to remove critical packages (e.g., `sudo`, `systemd`, `network-manager`, kernel meta packages)
+  * too many removals are detected (default threshold `40`)
+* Creates a backup directory for rollback
+* Post-conversion validation writes a report into the backup directory (always created)
 
 
 
@@ -210,16 +197,16 @@ The script includes guardrails to reduce “brick your system” outcomes:
 
 ### Logs
 
-* Main log file:
+* Main log:
 
   * `/var/log/ubuntu-to-mint/ubuntu-to-mint-YYYYMMDD-HHMMSS.log`
-* Plan output logs:
+* Plan logs:
 
   * `/var/log/ubuntu-to-mint/plan-YYYYMMDD-HHMMSS.txt`
 
 ### Backup directory
 
-During `convert`, a backup directory is created, for example:
+During `convert`, a backup directory is created, e.g.:
 
 * `/root/ubuntu-to-mint-backup-YYYYMMDD-HHMMSS/`
 
@@ -228,9 +215,11 @@ Contains:
 * `/etc/apt` backup
 * package inventories (`apt-manual`, holds, dpkg list)
 * enabled systemd services list
-* simulation output
-* (if present) saved list of held packages (when `--allow-unhold` is used)
-* (if used) disabled third-party sources captured for restore
+* snap/flatpak lists (if installed)
+* disabled third-party sources (if disabled)
+* **post-convert validation report**:
+
+  * `post-convert-validation.txt`
 
 
 
@@ -246,19 +235,6 @@ sudo apt-get -f install
 
 > Rollback restores APT configuration but may not remove packages installed during conversion.
 > For full restoration use Timeshift / snapshot / backup.
-
-
-
-## Recommended workflow (for best odds)
-
-1. Test in a VM first (same Ubuntu version and similar package set)
-2. Ensure **Timeshift** is configured and can restore
-3. Run:
-
-   * `doctor`
-   * `plan` and review logs
-4. Only then run `convert`
-5. Reboot and validate corporate tooling
 
 
 
@@ -281,20 +257,27 @@ sudo apt-get -f install
 * Inspect:
 
   * `journalctl -b -p err`
-* Consider reinstalling LightDM and the greeter:
+  * user session logs: `~/.xsession-errors`
+* Reinstall key desktop components:
 
-```bash
-sudo apt-get install --reinstall lightdm slick-greeter
-```
+  * `sudo apt-get install --reinstall lightdm slick-greeter cinnamon-session cinnamon-settings-daemon muffin`
 
-### Keyserver blocked / key import fails
+### Key retrieval / keyserver issues
 
-* The script attempts HKPS → HKP:80 → HTTPS fallback.
-* If a keyring already exists and is broken, try:
+This version avoids keyservers by default. It prefers:
 
-```bash
-sudo bash ubuntu-to-mint-convert-v3.sh convert --i-accept-the-risk --recreate-keyring
-```
+* a locally installed `linuxmint-keyring` package, or
+* downloading the latest `linuxmint-keyring_*.deb` from the Mint mirror and extracting the keyring
+
+If your existing keyring is corrupt:
+
+* rerun with `--recreate-keyring` or `--overwrite-keyring`
+
+### Known dpkg overwrite conflict (mintupdate)
+
+Some environments will hit a file conflict between `mintupdate` and `software-properties-gtk`
+over an icon file. The script installs the Mint stack with a guarded dpkg overwrite option
+to prevent conversion from halting.
 
 ### Corporate VPN/EDR breaks
 
