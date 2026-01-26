@@ -20,7 +20,7 @@ set -euo pipefail
 # =========================
 # Version
 # =========================
-SCRIPT_VERSION="4.7"
+SCRIPT_VERSION="4.8"
 
 # =========================
 # Globals / Defaults
@@ -115,10 +115,6 @@ Options:
   --with-recommends                Allow recommended packages (default: off)
   --yes                            Non-interactive / auto-confirm
   --i-accept-the-risk              Required for convert
-
-Notes:
-  - "plan" uses a temporary APT environment and does NOT modify your system's APT sources.
-  - "convert" modifies /etc/apt and installs Mint desktop/tooling packages on top of Ubuntu.
 EOF
 }
 
@@ -493,6 +489,45 @@ session_name_for_edition() {
   esac
 }
 
+ensure_lightdm_on_boot() {
+  # Make LightDM the default display manager and ensure graphical boot.
+  if [[ ! -d /run/systemd/system ]]; then
+    warn "systemd not detected; cannot enable LightDM on boot in this environment."
+    return 0
+  fi
+
+  info "Ensuring LightDM starts on boot (graphical.target + default display manager)..."
+
+  # Unmask LightDM in case something previously masked it
+  systemctl unmask lightdm >/dev/null 2>&1 || true
+
+  # Ensure the default DM marker is LightDM
+  echo "/usr/sbin/lightdm" > /etc/X11/default-display-manager || true
+
+  # Debian/Ubuntu DM selection often uses update-alternatives
+  if have_cmd update-alternatives; then
+    update-alternatives --set x-display-manager /usr/sbin/lightdm >/dev/null 2>&1 || true
+  fi
+
+  # Ensure graphical boot target
+  systemctl set-default graphical.target >/dev/null 2>&1 || true
+  systemctl enable graphical.target >/dev/null 2>&1 || true
+
+  # Enable LightDM for boot
+  systemctl enable lightdm >/dev/null 2>&1 || true
+
+  # Prevent GDM from stealing the greeter
+  if systemctl list-unit-files | awk '{print $1}' | grep -qx 'gdm3.service'; then
+    systemctl disable --now gdm3 >/dev/null 2>&1 || true
+    systemctl mask gdm3 >/dev/null 2>&1 || true
+  fi
+
+  # Restart the active DM if we can
+  systemctl restart lightdm >/dev/null 2>&1 || true
+
+  ok "LightDM configured to start on boot."
+}
+
 ensure_lightdm_defaults() {
   local sess
   sess="$(session_name_for_edition)"
@@ -501,11 +536,11 @@ ensure_lightdm_defaults() {
 
   DEBIAN_FRONTEND=noninteractive apt-get install -y lightdm slick-greeter
 
-  echo "/usr/sbin/lightdm" > /etc/X11/default-display-manager || true
-
+  # Keep Ubuntu's gdm3 installed (if present) but ensure it can't win.
   if systemctl is-enabled gdm3 >/dev/null 2>&1; then
     warn "Disabling gdm3 (keeping installed)."
     systemctl disable --now gdm3 || true
+    systemctl mask gdm3 || true
     if [[ -f /etc/gdm3/custom.conf ]]; then
       sed -i 's/^[#[:space:]]*WaylandEnable=.*/WaylandEnable=false/' /etc/gdm3/custom.conf || true
       grep -q '^WaylandEnable=' /etc/gdm3/custom.conf || echo 'WaylandEnable=false' >> /etc/gdm3/custom.conf
@@ -530,6 +565,7 @@ greeter-session=slick-greeter
 user-session=${sess}
 EOF
 
+  # Set default session for users
   for homedir in /home/*; do
     [[ -d "$homedir" ]] || continue
     local user
@@ -560,10 +596,10 @@ EOF
     chmod 644 "$dmrc" || true
   done
 
-  systemctl enable lightdm || true
-  systemctl restart lightdm || true
+  # This is the baked-in boot behavior you asked for:
+  ensure_lightdm_on_boot
 
-  ok "LightDM configured; default session set to ${sess}."
+  ok "LightDM defaults applied; default session set to ${sess}."
 }
 
 # =========================
@@ -602,24 +638,11 @@ post_install_sanity() {
       echo "FAIL"
     fi
     echo
-    echo "APT sources (Mint):"
-    grep -R --line-number -E '^[[:space:]]*deb .*packages\.linuxmint\.com' /etc/apt/sources.list /etc/apt/sources.list.d/*.list 2>/dev/null || true
-    echo
-    echo "LightDM default-display-manager:"
-    cat /etc/X11/default-display-manager 2>/dev/null || true
-    echo
-    echo "Xsession has_option sanity:"
-    if [[ -f /etc/X11/Xsession.d/20x11-common_process-args ]]; then
-      echo "OK: 20x11-common_process-args exists"
-    else
-      echo "MISSING: /etc/X11/Xsession.d/20x11-common_process-args"
-    fi
-    echo
-    echo "Session entries:"
-    ls -1 /usr/share/xsessions 2>/dev/null | egrep 'cinnamon|mate|xfce|ubuntu|gnome' || true
-    echo
-    echo "Broken packages:"
-    dpkg -C || true
+    echo "LightDM boot settings:"
+    echo "default-display-manager: $(cat /etc/X11/default-display-manager 2>/dev/null || echo MISSING)"
+    echo "lightdm enabled: $(systemctl is-enabled lightdm 2>/dev/null || echo unknown)"
+    echo "gdm3 enabled: $(systemctl is-enabled gdm3 2>/dev/null || echo not-installed)"
+    echo "default target: $(systemctl get-default 2>/dev/null || echo unknown)"
     echo
   } > "$out_file"
 
@@ -824,10 +847,9 @@ convert() {
 }
 
 # =========================
-# NEW: Parse args in any order
+# Parse args in any order
 # =========================
 parse_args_any_order() {
-  # Allows: script [options] <command> [options] [rollback_dir]
   while [[ $# -gt 0 ]]; do
     case "$1" in
       doctor|plan|convert|rollback)
@@ -837,34 +859,22 @@ parse_args_any_order() {
         CMD="$1"
         shift 1
         if [[ "$CMD" == "rollback" ]]; then
-          # First non-option token after rollback is the dir
           if [[ $# -gt 0 && "${1:-}" != --* ]]; then
             ROLLBACK_DIR="$1"
             shift 1
           fi
         fi
         ;;
-      --edition)
-        EDITION="${2:-}"; shift 2;;
-      --target)
-        TARGET_MINT="${2:-}"; shift 2;;
-      --mint-mirror)
-        MINT_MIRROR="${2:-}"; shift 2;;
-      --keep-ppas)
-        KEEP_PPAS="yes"; shift 1;;
-      --preserve-snap)
-        PRESERVE_SNAP="yes"; shift 1;;
-      --with-recommends)
-        WITH_RECOMMENDS="yes"; shift 1;;
-      --yes)
-        ASSUME_YES="yes"; shift 1;;
-      --i-accept-the-risk)
-        I_ACCEPT_RISK="yes"; shift 1;;
-      -h|--help|help)
-        usage; exit 0;;
-      *)
-        die "Unknown argument: $1"
-        ;;
+      --edition) EDITION="${2:-}"; shift 2;;
+      --target) TARGET_MINT="${2:-}"; shift 2;;
+      --mint-mirror) MINT_MIRROR="${2:-}"; shift 2;;
+      --keep-ppas) KEEP_PPAS="yes"; shift 1;;
+      --preserve-snap) PRESERVE_SNAP="yes"; shift 1;;
+      --with-recommends) WITH_RECOMMENDS="yes"; shift 1;;
+      --yes) ASSUME_YES="yes"; shift 1;;
+      --i-accept-the-risk) I_ACCEPT_RISK="yes"; shift 1;;
+      -h|--help|help) usage; exit 0;;
+      *) die "Unknown argument: $1" ;;
     esac
   done
 }
